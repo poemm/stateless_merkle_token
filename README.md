@@ -1,23 +1,23 @@
 # Stateless Token Contract
 
-## Introduction
-
-This is an experiment to write a stateless token contract for blockchains like Ethereum. A problem with current (2019) token contracts is that the state (account balances) is stored on-chain, but state growth is unsustainable. A proposed solution is stateless contracts, which only put a state hash on-chain, and all account balances are maintained off-chain.
-
-A stateless token contract must verify account balances against the state hash, apply balance transfers, and update the state hash to finalize any balance transfers.
-
-We use a [Merkle hash](https://en.wikipedia.org/wiki/Merkle_tree) as the state hash. Off-chain, all balances are maintained in a binary tree, which we merkleize on-chain for account verification and to finalize balance updates.
-
-Related work includes Vitalik Buterin et. al.'s [SSZ partials as merkle proofs](https://github.com/ethereum/eth2.0-specs/pull/1186/) and Alexey Akhunov's [merkle proofs for Eth 1.0](https://github.com/ledgerwatch/turbo-geth/blob/visual/docs/programmers_guide/guide.md).
-
-An alternative to Merkle trees is RSA accumulators. An exciting new direction is using zero-knowledge tricks to verify token transfers succinctly.
-
 ## The Code
 
-`merkle_token_contract.py` is the on-chain logic, to be ported and compiled to Wasm. `merkle_token_offchain.py` is for off-chain things like generating merkle proofs, although it algorithms are naive for now. To see merkle proof sizes for various numbers of accounts in the state and the proof, try:
+`merkle_token_contract.py` is the on-chain logic, to be ported and compiled to Wasm. `merkle_token_offchain.py` is for off-chain things like generating merkle proofs, although it algorithms are naive for now. To see merkle proof sizes for various numbers of accounts in the state and various numbers of acconts in the proof, try:
 ```
 python3 python3 merkle_token_offchain.py
 ```
+
+## Introduction
+
+This is an experiment to write a stateless token contract for blockchains like Ethereum. A problem with current token contracts is that the state (account addresses and balances) is stored on-chain -- state growth has been unsustainable. A proposed solution is stateless contracts, which only put a state hash on-chain, and all account balances are maintained off-chain.
+
+A stateless token contract must verify account balances against the on-chain state hash, apply balance transfers, and update the state hash to finalize balance transfers.
+
+We use a [Merkle hash](https://en.wikipedia.org/wiki/Merkle_tree) as the state hash. All balances are maintained off-chain in a binary tree, which we use to generate merkle proofs in an encoding which is convenient to merkleize on-chain.
+
+Related work includes Vitalik Buterin et. al.'s [SSZ partials as merkle proofs](https://github.com/ethereum/eth2.0-specs/pull/1186/) and Alexey Akhunov's [merkle proofs for Eth 1.0](https://github.com/ledgerwatch/turbo-geth/blob/visual/docs/programmers_guide/guide.md). An alternative to Merkle trees is RSA accumulators. An exciting new direction is using zero-knowledge tricks to verify token transfers more succinctly.
+
+
 
 ## Binary Tree
 
