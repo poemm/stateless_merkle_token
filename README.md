@@ -86,7 +86,7 @@ Three nodes:
 
 
 
-### Node Labels: Children Pattern Sequence
+## Node Labels: Children Pattern Sequence
 
 **Definition** A tree with *node labels* has a label at each node.
 
@@ -282,7 +282,7 @@ MAIN()
  - Succinct zero knowledge merklization may allow omitting merkle hashes.
 
 
-# Contract Execution Speed
+## Contract Execution Speed
 
 **Remark.** It is expensive to verify signatures, expensive to compute merkle roots, and expensive to hash. Some possible solutions:
  - We combine verify and update to a single pass.
