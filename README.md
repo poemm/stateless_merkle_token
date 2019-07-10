@@ -142,12 +142,12 @@ Corresponding radix tree using label 0 for left child and 1 for right child:
    x    x 
       0/ \1
       x   x
-'''
+```
 
 **Definition.** We define *Optimization 1* and *Optimizaiton 2* below by example.
 
 **Example.** Consider the tree in the above example.
-'''
+```
 Optimization 1: leaves need no labels, since depth is fixed, so can determine whether it is a leaf from its depth.
      11
  010/  \11
@@ -315,6 +315,7 @@ MAIN()
 ## References
 
 [Knuth, 1997] Knuth, Art of Computer Programming, Volume 1, 3rd ed.
+
 [Katajainen and Makinen, 1990] Katajainen, Makinen. Tree Compression and Optimizatin With Applications, 1990. 
 
 
