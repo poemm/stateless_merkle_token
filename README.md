@@ -316,7 +316,7 @@ MAIN()
 
 ## DoS attack
 
-**Remark.** It may take a long time to verify the merkle root and signatures, so it may be necessary to charge for gas outside of the token. Or with simple on-leaf Merkle proofs.
+**Remark.** It may take a long time to verify the merkle root and signatures, so it may be necessary to charge for gas outside of the token. Or with a separatec 2-leaf block with one transaction.
 
 
 ## References
