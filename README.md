@@ -3,6 +3,8 @@
 ## The Code
 
 `merkle_token_contract.py` is the on-chain logic, to be ported and compiled to Wasm. `merkle_token_offchain.py` is for off-chain things like generating merkle proofs, although its algorithms are naive for now. To see merkle proof sizes for various numbers of accounts in the state and various numbers of acconts in the proof, try:
+
+WARNING: Won't work, go back a commit, or wait until overhaul is done.
 ```
 python3 merkle_token_offchain.py
 ```

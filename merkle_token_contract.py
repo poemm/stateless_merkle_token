@@ -116,7 +116,6 @@ def recover_addresses(address_prefix, depth):
     address_chunk = get_next_address_chunk()
     recover_addresses(address_prefix+address_chunk, depth+len(address_chunk))
 
-
 # this is a single-pass to merkleize the old root and the new root
 # this should be called after addresses are recovered, and new balances are created from transactions
 def merklize_old_and_new_root(depth):

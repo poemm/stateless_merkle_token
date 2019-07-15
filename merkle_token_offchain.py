@@ -1,6 +1,8 @@
 
-import merkle_token_contract
 
+
+
+import merkle_token_contract
 
 # flip this flag if you want more printed
 verbose = 1
@@ -116,8 +118,12 @@ def build_merkle_proof(depth,sorted_addresses,accounts,merkle_tree,tree_encoding
     proof_hashes += reversed(proof_hashes_for_chunk)
 
 
-def encode_calldata(transactions, balances, address_chunks,proof_hashes,tree_encoding):
-  # calldata is a dictionary for prot0typing, will later encode everything as a bytearray
+
+binary_calldata_encoding_flag = 1
+
+def encode_calldata(transactions, balances, address_chunks, proof_hashes, tree_encoding, sorted_addresses=None):
+ if not binary_calldata_encoding_flag:
+  # calldata is a dictionary for prototyping, will later encode everything as a bytearray
   calldata={}
   calldata["transactions"] = transactions
   calldata["balances"] = balances
@@ -125,10 +131,116 @@ def encode_calldata(transactions, balances, address_chunks,proof_hashes,tree_enc
   calldata["proof_hashes"] = proof_hashes
   calldata["tree_encoding"] = tree_encoding
   return calldata
+ else:
+  # calldata as bytes
+  calldata=bytearray([])
+  # function to append chunk byte length before appending chunk
+  def encode_chunk(chunk):
+   print("length of chunk: ",len(chunk))
+   nonlocal calldata
+   calldata+=len(chunk).to_bytes(4, byteorder='little')
+   calldata+=chunk
+  # encode hashes as concatenation
+  hashes_bytes = bytearray([])
+  for h in proof_hashes:
+    hashes_bytes += bytearray.fromhex(h)
+  encode_chunk(hashes_bytes)
+  # encode sorted addresses, may be empty
+  addresses_bytes = bytearray([])
+  for addy in sorted_addresses:
+    addy_as_bytes = int(addy,2).to_bytes((merkle_token_contract.num_address_bits + 7) // 8, 'big')
+    addresses_bytes += addy_as_bytes
+  encode_chunk(addresses_bytes)
+  # encode balances
+  balance_bytes = bytearray([])
+  for b in balances:
+    balance_bytes += b.to_bytes(8, byteorder='little')
+  encode_chunk(balance_bytes)
+  # encode transactions
+  # TODO
+  # encode tree encoding
+  tree_encoding_bytes = bytearray([])
+  # NOTE this is the right way, but we don't feel like bit twiddling yet, so just give each opcode a byte
+  #tree_encoding_length = len(tree_encoding)
+  #tree_encoding_concat=''.join(tree_encoding)
+  #tree_encoding_int = int(tree_encoding_concat, 2)
+  #tree_encoding_bytes += tree_encoding_int.to_bytes((tree_encoding_int.bit_length()+7)//8, byteorder='little')
+  # this is naive, but don't want to bit twiddle yet
+  for e in tree_encoding:
+    tree_encoding_bytes += bytearray([int(e, 2)])
+  encode_chunk(tree_encoding_bytes)
+  # encode address chunks
+  address_chunks_bytes = bytearray([])
+  for addy_chunk in address_chunks:
+    addy_chunk_bits_length = len(addy_chunk)
+    addy_chunk_encoding_int = int(addy_chunk, 2)
+    address_chunks_bytes += bytearray([addy_chunk_bits_length]) + addy_chunk_encoding_int.to_bytes((addy_chunk_bits_length+7)//8, byteorder='big')
+  encode_chunk(address_chunks_bytes)
+  # done
+  return calldata
+  
+  
 
-
-
-
+def decode_calldata(calldata):
+ if not binary_calldata_encoding_flag:
+  pass
+ else:
+  idx = 0
+  # decode proof hashes
+  proof_hashes = []
+  proof_hashes_length=int.from_bytes(calldata[idx:idx+4],'little')
+  idx+=4
+  num_hash_bytes = merkle_token_contract.num_hash_bits//8
+  for i in range(proof_hashes_length//num_hash_bytes):
+    proof_hashes += [calldata[idx:idx+num_hash_bytes].hex()]
+    idx+=num_hash_bytes
+  print("proof hashes: ",proof_hashes)
+  # decode sorted addresses, may be empty
+  num_address_bytes = (merkle_token_contract.num_address_bits+7)//8
+  addresses = []
+  addresses_length=int.from_bytes(calldata[idx:idx+4],'little')
+  idx+=4
+  addresses_end = idx + addresses_length
+  while idx < addresses_end:
+    addresses += [bin(int.from_bytes(calldata[idx:idx+num_address_bytes],'big'))[2:].zfill(merkle_token_contract.num_address_bits)]
+    idx += num_address_bytes
+  print("addresses",addresses)
+  # decode balances
+  balances = []
+  balances_length=int.from_bytes(calldata[idx:idx+4],'little')
+  idx+=4
+  num_balance_bytes = merkle_token_contract.num_balance_bits//8
+  balance_bytes_end = idx + balances_length
+  while idx < balance_bytes_end:
+    balances += [int.from_bytes(calldata[idx:idx+num_balance_bytes],'little')]
+    idx+=num_balance_bytes
+  print("balances",balances)
+  # decode transactions
+  # TODO
+  # decode tree encoding
+  tree_encoding = []
+  tree_encoding_length=int.from_bytes(calldata[idx:idx+4],'little')
+  idx+=4
+  tree_encoding_bytes_end = idx + tree_encoding_length
+  while idx < tree_encoding_bytes_end:
+    tree_encoding += [bin(int.from_bytes(calldata[idx:idx+1],'little'))[2:].zfill(2)]
+    idx+=1
+  print("tree encoding ",tree_encoding)
+  # decode address chunks or addresses
+  address_chunks = []
+  address_chunks_length=int.from_bytes(calldata[idx:idx+4],'little')
+  idx+=4
+  address_chunks_end = idx+address_chunks_length
+  while idx < address_chunks_end:
+    addy_chunk_bits_length = int.from_bytes(calldata[idx:idx+1],'little')
+    idx += 1
+    addy_chunk_bytes_length = (addy_chunk_bits_length+7)//8
+    address_chunks += [bin(int.from_bytes(calldata[idx:idx+addy_chunk_bytes_length],'big'))[2:].zfill(addy_chunk_bits_length)]
+    idx += addy_chunk_bytes_length
+  #  idx += addy_chunk_bytes_length
+  print("address chunks: ",address_chunks)
+  #print( proof_hashes, balances, tree_encoding, address_chunks)
+  return proof_hashes, balances, tree_encoding, address_chunks
 
 
 
@@ -250,9 +362,9 @@ def test_random_loop():
 
 def test_handwritten(case):
 
-  # choose a case, each is hand-written
+  # choose a case below
   if case==1:
-    merkle_token_contract.nnum_address_bits = 4
+    merkle_token_contract.num_address_bits = 4
     # all accounts and their balances
     accounts = { \
       '0010': 2, \
@@ -291,6 +403,7 @@ def test_handwritten(case):
   else:
     return
 
+
   # print all of the accounts, and the address to be used in the proof
   print("accounts:",accounts)
   print("sorted_accounts (appearing in transactions):",sorted_addresses)
@@ -322,16 +435,18 @@ def test_handwritten(case):
   print("proof_hashes ", proof_hashes)
 
   # encode calldata
-  calldata = encode_calldata(transactions, balances, address_chunks,proof_hashes,tree_encoding)
+  calldata = encode_calldata(transactions, balances, address_chunks,proof_hashes,tree_encoding, sorted_addresses=sorted_addresses)
+  print("calldata has length",len(calldata),calldata)
+  decode_calldata(calldata)
   
   # call the contract
-  merkle_token_contract.main(calldata)
+  #merkle_token_contract.main(calldata)
 
 
 
 if __name__ == "__main__":
   # uncomment one of these
   #test_random()
-  test_random_loop()
-  #test_handwritten(2)
+  #test_random_loop()
+  test_handwritten(1)
 
