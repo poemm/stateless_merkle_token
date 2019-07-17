@@ -64,39 +64,25 @@ typedef uint32_t i32ptr; // same as i32 in WebAssembly, but treated as a pointer
 // ethereum interface functions
 
 
-// needed for ecrecover, not sure where these belong
-/*
-#define SIZE_MAX 65535
-long long __multi3 (long long a, long long b){
-  return a*b;
-}
-*/
 
 
 ////////////////////////////
 // EEI Method Declaration //
 ////////////////////////////
 
-
-
 void eth2_loadPreStateRoot(uint32_t* offset);
 uint32_t eth2_blockDataSize();
-//void eth2_blockDataCopy(const uint32_t* outputOfset, uint32_t offset, uint32_t length);
 void eth2_blockDataCopy(uint32_t* outputOfset, uint32_t offset, uint32_t length);
 void eth2_savePostStateRoot(uint32_t* offset);
-//void eth2_pushNewDeposit(const uint32_t* offset, uint32_t length);
 void eth2_pushNewDeposit(uint32_t* offset, uint32_t length);
 
 #ifdef NATIVE
-/*
+// dummy functions
 void eth2_loadPreStateRoot(uint32_t* offset){return;}
 uint32_t eth2_blockDataSize(){return 1;}
-//void eth2_blockDataCopy(const uint32_t* outputOfset, uint32_t offset, uint32_t length);
 void eth2_blockDataCopy(uint32_t offset, uint32_t length, uint32_t* outputOfset){return;}
 void eth2_savePostStateRoot(const uint32_t* offset){return;}
-//void eth2_pushNewDeposit(const uint32_t* offset, uint32_t length);
 void eth2_pushNewDeposit(uint32_t* offset, uint32_t length){return;}
-*/
 #endif
 
 
@@ -165,32 +151,45 @@ void* malloc(const size_t size){
 
   heap_ptr = (uint8_t*)total_bytes_needed;
   return (void*)(heap_ptr-size);
-
-
 }
 
 __attribute__ ((noinline))
 void* memcpy(void* restrict destination, const void* restrict source, size_t len) {
-  // TODO: do this in 64-bit chunks, then 8-bit chunks at end
   uint8_t* destination_ptr = (uint8_t*) destination;
   uint8_t* source_ptr = (uint8_t*) source;
-  while (len-- > 0) {
-    *destination_ptr++ = *source_ptr++;
+  // copy 8-byte chunks
+  while (len > 7) {
+    *(uint64_t*)destination_ptr = *(uint64_t*)source_ptr;
+    destination_ptr+=8;
+    source_ptr+=8;
+    len-=8;
   }
+  // copy rest 1-byte at a time
+  while (len-- > 0)
+    *destination_ptr++ = *source_ptr++;
   return destination;
 }
 
 __attribute__ ((noinline))
 void* memset(void* restrict in, int c, size_t len) {
-  // TODO: do this in 64-bit chunks, then 8-bit chunks at end
   uint8_t* in_ptr = (uint8_t*)in;
+  if (len>8){
+    // set in 8-byte chunks
+    uint64_t c64 = c + (c<<8) + (c<<16) + (c<<24) + (c<<32) + (c<<40) + (c<<56);
+    while (len > 7) {
+      *(uint64_t*)in_ptr = c64;
+      in_ptr+=8;
+      len-=8;
+    }
+  }
+  // set rest 1-byte at a time
   while (len-- > 0) {
     *in_ptr++ = c;
   }
   return in_ptr;
 }
 
-__attribute__ ((noinline))
+//__attribute__ ((noinline))
 int memcmp ( const void * in1, const void * in2, size_t num ){
   // TODO: do this in 64-bit chunks, then 8-bit chunks at end
   uint8_t* in1_ptr = (uint8_t*) in1;
@@ -259,7 +258,13 @@ i64 reverse_bytes_64(i64 a){
   return b;
 }
 
-
+// needed for ecrecover, not sure where these belong
+/*
+#define SIZE_MAX 65535
+long long __multi3 (long long a, long long b){
+  return a*b;
+}
+*/
 
 // for testing, can export start fuction
 //void _start(){  _main(); }
