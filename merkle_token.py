@@ -31,6 +31,9 @@ def finish():
 num_address_bits=160
 num_hash_bits=160
 num_balance_bits=64
+num_balance_bytes = (num_balance_bits+7)//8
+num_address_bytes = (num_address_bits+7)//8
+num_hash_bytes = (num_hash_bits+7)//8
 
 # some global variables
 old_state_root = ''
@@ -50,6 +53,7 @@ def hash_(to_hash):
     to_hash = to_hash.to_bytes((to_hash.bit_length() + 7) // 8, 'big')
   h.update(to_hash)
   #print("hash_(",to_hash.hex(),") -> ",h.hexdigest())
+  #print("hash_() ",to_hash.hex()," ->", h.hexdigest())
   return h.hexdigest()
 
 
@@ -119,8 +123,10 @@ def recover_addresses(address_prefix, depth):
 # this is a single-pass to merkleize the old root and the new root
 # this should be called after addresses are recovered, and new balances are created from transactions
 def merklize_old_and_new_root(depth):
+  print("merklize_old_and_new_root(",depth,")")
   # if leaf, hash it's address and value
   if depth == num_address_bits:
+    print("merklize_old_and_new_root(",depth,")  leaf")
     old_balance = get_next_old_balance()
     new_balance = get_next_new_balance()
     address = get_next_address()
@@ -129,6 +135,7 @@ def merklize_old_and_new_root(depth):
   # otherwise, process the tree node, i.e. the opcode
   global opcode_idx
   opcode = tree_encoding[opcode_idx]
+  print("merklize_old_and_new_root(",depth,")  opcode",opcode)
   opcode_idx+=1
   if opcode == '11':
     left_hash_old, left_hash_new = merklize_old_and_new_root(depth+1)
@@ -144,6 +151,7 @@ def merklize_old_and_new_root(depth):
     return hash_(int(left_hash+right_hash_old,16)),hash_(int(left_hash+right_hash_new,16))
   elif opcode == '00':
     address_chunk = get_next_address_chunk()
+    print("merklize_old_and_new_root(",depth,")  opcode address_chunk",opcode,address_chunk)
     return merklize_old_and_new_root(depth+len(address_chunk))
 
 

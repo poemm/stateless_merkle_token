@@ -27,7 +27,8 @@ export LLVM := /home/user/repos/llvm9/llvm-project/build/bin/
 export WABT_DIR := ~/repos/wabt/wabt-1.0.10/
 export BINARYEN_DIR := ~/repos/binaryen/binaryen-version_81/
 
-export OPT := -O0
+
+export OPT := -O3
 
 default: merkle_token
 
@@ -84,6 +85,14 @@ ifeq (, $(shell which $(LLVM)wasm-ld))
 	$(error $(LLVM_ERROR))
 endif
 
+test:
+	cd ..; python3 merkle_token_offchain.py
+	cp ../generated.yaml .
+	~/repos/ethereum/scout_git_20190715/target/release/phase2-scout generated.yaml
+	
+
+native:
+	gcc merkle_token.c -DNATIVE=1
 
 # Build, convert, optimize
 merkle_token:
@@ -98,9 +107,9 @@ merkle_token:
 	sed -i -e 's/(export "_main" (func $$_main))/(export "main" (func $$_main))/g' merkle_token.wat
 	$(WABT_DIR)wat2wasm merkle_token.wat > merkle_token.wasm
 	# size optimize
-	$(BINARYEN_DIR)wasm-opt $(OPT) merkle_token.wasm -o merkle_token.wasm
+	$(BINARYEN_DIR)wasm-opt $(OPT) merkle_token.wasm -o merkle_token.wasm -g #-g keeps names but takes some size
 	# save text format of final ewasm contract
-	$(WABT_DIR)wasm2wat merkle_token.wasm > merkle_token.wat
+	$(WABT_DIR)wasm2wat merkle_token.wasm > merkle_token2.wat
 	# remove intermediate files
 	rm -f merkle_token.ll merkle_token.o merkle_token_raw.wasm merkle_token_raw.wat
 

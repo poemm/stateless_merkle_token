@@ -2,10 +2,10 @@
 
 
 
-import merkle_token_contract
+import merkle_token
 
 # flip this flag if you want more printed
-verbose = 1
+verbose = 0
 
 
 
@@ -23,7 +23,12 @@ def build_merkle_tree(depth,sorted_addresses,accounts,merkle_tree):
   # if leaf
   if len(sorted_addresses) == 1:
     addr = sorted_addresses[0]
-    current_hash = merkle_token_contract.hash_(int(addr+bin(accounts[addr])[2:].zfill(merkle_token_contract.num_balance_bits),2))
+    addr_as_bytes = int(addr,2).to_bytes(merkle_token.num_address_bytes, byteorder='big')
+    balance_as_bits = bin(accounts[addr])[2:].zfill(merkle_token.num_balance_bits) #bin(int.from_bytes((accounts[addr]).to_bytes(merkle_token.num_balance_bytes, byteorder='little'), "big")[2:].zfill(merkle_token.num_balance_bits),2)
+    balance_as_bytes = int(balance_as_bits,2).to_bytes(merkle_token.num_balance_bytes, byteorder='little')
+    if verbose: print("going to hash addr balance",addr,accounts[addr],(addr_as_bytes+balance_as_bytes).hex())
+    if verbose: print("num_address_bytes",merkle_token.num_address_bytes)
+    current_hash = merkle_token.hash_(addr_as_bytes+balance_as_bytes)
     merkle_tree[addr[:depth]] = (current_hash, addr[depth:])
   else: # not leaf
     # find common address chunk for sorted addresses
@@ -39,7 +44,8 @@ def build_merkle_tree(depth,sorted_addresses,accounts,merkle_tree):
     # recurse left and right
     left_hash = build_merkle_tree(d+1, sorted_addresses[:idx], accounts, merkle_tree)
     right_hash = build_merkle_tree(d+1, sorted_addresses[idx:], accounts, merkle_tree)
-    current_hash = merkle_token_contract.hash_(int(left_hash+right_hash,16))
+    hash_as_bytes = int(left_hash+right_hash,16).to_bytes(merkle_token.num_hash_bytes*2, byteorder='big')
+    current_hash = merkle_token.hash_(hash_as_bytes)
     merkle_tree[address_prefix] = ( current_hash, address_chunk )
   return current_hash
 
@@ -47,6 +53,7 @@ def build_merkle_tree(depth,sorted_addresses,accounts,merkle_tree):
 
 # this function builds tree_encoding, address_chunks, and balances in depth-first pre-order, and builds proof_hashes in depth-first post-order
 def build_merkle_proof(depth,sorted_addresses,accounts,merkle_tree,tree_encoding,address_chunks,balances,proof_hashes):
+  #if verbose: print("build_merkle_proof(",depth,")")
   assert len(merkle_tree)>0 # the merkle tree exists, also built with build_merkle_tree() and contains the addresses in sorted_addresses
   assert len(sorted_addresses)>0 # sorted_addresses is a nonempty list of addresses, also must be sorted
   # get prefix of address at this depth
@@ -121,7 +128,7 @@ def build_merkle_proof(depth,sorted_addresses,accounts,merkle_tree,tree_encoding
 
 binary_calldata_encoding_flag = 1
 
-def encode_calldata(transactions, balances, address_chunks, proof_hashes, tree_encoding, sorted_addresses=None):
+def encode_calldata(transactions, balances, address_chunks, proof_hashes, tree_encoding, sorted_addresses=[]):
  if not binary_calldata_encoding_flag:
   # calldata is a dictionary for prototyping, will later encode everything as a bytearray
   calldata={}
@@ -136,7 +143,8 @@ def encode_calldata(transactions, balances, address_chunks, proof_hashes, tree_e
   calldata=bytearray([])
   # function to append chunk byte length before appending chunk
   def encode_chunk(chunk):
-   print("length of chunk: ",len(chunk))
+   #if verbose: print("length of chunk: ",len(chunk))
+   if verbose: print("calldata appending chunk:",chunk.hex())
    nonlocal calldata
    calldata+=len(chunk).to_bytes(4, byteorder='little')
    calldata+=chunk
@@ -148,13 +156,15 @@ def encode_calldata(transactions, balances, address_chunks, proof_hashes, tree_e
   # encode sorted addresses, may be empty
   addresses_bytes = bytearray([])
   for addy in sorted_addresses:
-    addy_as_bytes = int(addy,2).to_bytes((merkle_token_contract.num_address_bits + 7) // 8, 'big')
+    addy_as_bytes = int(addy,2).to_bytes(merkle_token.num_address_bytes, 'big')
     addresses_bytes += addy_as_bytes
   encode_chunk(addresses_bytes)
   # encode balances
   balance_bytes = bytearray([])
   for b in balances:
-    balance_bytes += b.to_bytes(8, byteorder='little')
+    balance_bytes += b.to_bytes(merkle_token.num_balance_bytes, byteorder='little')
+    if verbose: print("balance:",b.to_bytes(merkle_token.num_balance_bytes, byteorder='little').hex())
+  if verbose: print("balance_bytes",balance_bytes.hex())
   encode_chunk(balance_bytes)
   # encode transactions
   # TODO
@@ -190,31 +200,28 @@ def decode_calldata(calldata):
   proof_hashes = []
   proof_hashes_length=int.from_bytes(calldata[idx:idx+4],'little')
   idx+=4
-  num_hash_bytes = merkle_token_contract.num_hash_bits//8
-  for i in range(proof_hashes_length//num_hash_bytes):
-    proof_hashes += [calldata[idx:idx+num_hash_bytes].hex()]
-    idx+=num_hash_bytes
-  print("proof hashes: ",proof_hashes)
+  for i in range(proof_hashes_length//merkle_token.num_hash_bytes):
+    proof_hashes += [calldata[idx:idx+merkle_token.num_hash_bytes].hex()]
+    idx+=merkle_token.num_hash_bytes
+  if verbose: print("proof hashes: ",proof_hashes)
   # decode sorted addresses, may be empty
-  num_address_bytes = (merkle_token_contract.num_address_bits+7)//8
   addresses = []
   addresses_length=int.from_bytes(calldata[idx:idx+4],'little')
   idx+=4
   addresses_end = idx + addresses_length
   while idx < addresses_end:
-    addresses += [bin(int.from_bytes(calldata[idx:idx+num_address_bytes],'big'))[2:].zfill(merkle_token_contract.num_address_bits)]
-    idx += num_address_bytes
-  print("addresses",addresses)
+    addresses += [bin(int.from_bytes(calldata[idx:idx+merkle_token.num_address_bytes],'big'))[2:].zfill(merkle_token.num_address_bits)]
+    idx += merkle_token.num_address_bytes
+  if verbose: print("addresses",addresses)
   # decode balances
   balances = []
   balances_length=int.from_bytes(calldata[idx:idx+4],'little')
   idx+=4
-  num_balance_bytes = merkle_token_contract.num_balance_bits//8
   balance_bytes_end = idx + balances_length
   while idx < balance_bytes_end:
-    balances += [int.from_bytes(calldata[idx:idx+num_balance_bytes],'little')]
-    idx+=num_balance_bytes
-  print("balances",balances)
+    balances += [int.from_bytes(calldata[idx:idx+merkle_token.num_balance_bytes],'little')]
+    idx+=merkle_token.num_balance_bytes
+  if verbose: print("balances",balances)
   # decode transactions
   # TODO
   # decode tree encoding
@@ -225,7 +232,7 @@ def decode_calldata(calldata):
   while idx < tree_encoding_bytes_end:
     tree_encoding += [bin(int.from_bytes(calldata[idx:idx+1],'little'))[2:].zfill(2)]
     idx+=1
-  print("tree encoding ",tree_encoding)
+  if verbose: print("tree encoding ",tree_encoding)
   # decode address chunks or addresses
   address_chunks = []
   address_chunks_length=int.from_bytes(calldata[idx:idx+4],'little')
@@ -238,8 +245,8 @@ def decode_calldata(calldata):
     address_chunks += [bin(int.from_bytes(calldata[idx:idx+addy_chunk_bytes_length],'big'))[2:].zfill(addy_chunk_bits_length)]
     idx += addy_chunk_bytes_length
   #  idx += addy_chunk_bytes_length
-  print("address chunks: ",address_chunks)
-  #print( proof_hashes, balances, tree_encoding, address_chunks)
+  if verbose: print("address chunks: ",address_chunks)
+  #if verbose: print( proof_hashes, balances, tree_encoding, address_chunks)
   return proof_hashes, balances, tree_encoding, address_chunks
 
 
@@ -251,16 +258,42 @@ def decode_calldata(calldata):
 # Tests #
 #########
 
+def generate_scout_test_yaml(merkle_root, calldata):
+  if verbose: print(type(merkle_root),type(calldata.hex()), calldata.hex())
+  f = open('generated.yaml', 'w')
+  file_text="""beacon_state:
+  execution_scripts:
+    - merkle_token.wasm
+shard_pre_state:
+  exec_env_states:
+    - "%s000000000000000000000000"
+shard_blocks:
+  - env: 0
+    data: ""
+  - env: 0
+    data: "%s"
+shard_post_state:
+  exec_env_states:
+    - "%s000000000000000000000000"
+"""%(merkle_root,calldata.hex(),merkle_root)
+  if verbose: print(file_text)
+  f.write(file_text)
+  f.close
 
-def test_random(num_address_bits=16, num_addresses_in_witness=160):
+def generate_C_test():
+  [int(calldata[i:i+2],16) for i in range(0, len(calldata), 2)]
+
+
+
+def test_random(num_address_bits=160, num_accounts=2**22, num_addresses_in_witness=20):
 
   # init global in contract
-  merkle_token_contract.num_address_bits = num_address_bits
+  merkle_token.num_address_bits = num_address_bits
+  merkle_token.num_address_bytes = (num_address_bits+7)//8
 
   # generate random addresses and balances
   import random
-  num_accounts=2**num_address_bits
-  accounts = {bin(random.randint(0,2**num_address_bits-1))[2:].zfill(num_address_bits):random.randint(0, 2**merkle_token_contract.num_balance_bits-1) for i in range(num_accounts)}
+  accounts = {bin(random.randint(0,2**merkle_token.num_address_bits-1))[2:].zfill(merkle_token.num_address_bits):random.randint(0, 2**merkle_token.num_balance_bits-1) for i in range(num_accounts)}
   if verbose: print(accounts)
 
   # transactions are empty until we prototype them
@@ -275,7 +308,7 @@ def test_random(num_address_bits=16, num_addresses_in_witness=160):
   build_merkle_tree(0, sorted(accounts), accounts, merkle_tree)
   if verbose: print()
   if verbose: print(merkle_tree)
-  merkle_token_contract.set_state_root(merkle_tree[''][0])
+  merkle_token.set_state_root(merkle_tree[''][0])
 
   # build merkle proof for sorted_accounts
   tree_encoding = []
@@ -294,9 +327,9 @@ def test_random(num_address_bits=16, num_addresses_in_witness=160):
   length_of_tree_encoding_bytes = (length_of_tree_encoding_bits+7)//8
   length_of_address_chunks_bits = len(address_chunks)*8+sum(len(chunk) for chunk in address_chunks)
   length_of_address_chunks_bytes = (length_of_address_chunks_bits + 7)//8
-  length_of_balances_bits = len(balances)*merkle_token_contract.num_balance_bits
+  length_of_balances_bits = len(balances)*merkle_token.num_balance_bits
   length_of_balances_bytes = (length_of_balances_bits + 7)//8
-  length_of_hashes_bits = len(proof_hashes)*num_hash_bits
+  length_of_hashes_bits = len(proof_hashes)*merkle_token.num_hash_bits
   length_of_hashes_bytes = (length_of_hashes_bits + 7)//8
   if verbose: print("sizes: tree_encoding:",length_of_tree_encoding_bytes,\
                   "  addy chunks",length_of_address_chunks_bytes,\
@@ -305,22 +338,25 @@ def test_random(num_address_bits=16, num_addresses_in_witness=160):
                   "  total", length_of_tree_encoding_bytes+length_of_address_chunks_bytes+length_of_balances_bytes+length_of_hashes_bytes)
 
   # encode calldata
-  calldata = encode_calldata(transactions, balances, address_chunks,proof_hashes,tree_encoding)
+  calldata = encode_calldata(transactions, balances, address_chunks,proof_hashes,tree_encoding,sorted_addresses=sorted_addresses)
+  #if verbose: print("calldata has length",len(calldata),calldata.hex())
+  #if verbose: print("merkle_root",merkle_tree[''][0])
+  generate_scout_test_yaml(merkle_tree[''][0], calldata)
 
   # call the contract
-  merkle_token_contract.main(calldata)
+  #merkle_token.main(calldata)
 
 
 def test_random_loop():
 
-  for merkle_token_contract.num_address_bits in [10,12,14,16,18,20]:
+  for merkle_token.num_address_bits in [10,12,14,16,18,20]:
     # generate random addresses and balances
     import random
-    num_accounts=2**merkle_token_contract.num_address_bits
-    accounts = {bin(random.randint(0,2**merkle_token_contract.num_address_bits-1))[2:].zfill(merkle_token_contract.num_address_bits):random.randint(0, 2**merkle_token_contract.num_balance_bits-1) for i in range(num_accounts)}
+    num_accounts=2**merkle_token.num_address_bits
+    accounts = {bin(random.randint(0,2**merkle_token.num_address_bits-1))[2:].zfill(merkle_token.num_address_bits):random.randint(0, 2**merkle_token.num_balance_bits-1) for i in range(num_accounts)}
     # iterate over number of addresses in the witness
     for num_addresses_in_witness in [10,20,40,80,160]:
-      print("\nnum accounts: 2^",merkle_token_contract.num_address_bits," num addresses in merkle proof:",num_addresses_in_witness)
+      if verbose: print("\nnum accounts: 2^",merkle_token.num_address_bits," num addresses in merkle proof:",num_addresses_in_witness)
 
       # transactions are empty until we prototype them
       transactions = []
@@ -330,7 +366,7 @@ def test_random_loop():
 
       merkle_tree = {}
       build_merkle_tree(0, sorted(accounts), accounts, merkle_tree)
-      merkle_token_contract.set_state_root(merkle_tree[''][0])
+      merkle_token.set_state_root(merkle_tree[''][0])
 
       tree_encoding = []
       address_chunks = []
@@ -342,9 +378,9 @@ def test_random_loop():
       length_of_tree_encoding_bytes = (length_of_tree_encoding_bits+7)//8
       length_of_address_chunks_bits = len(address_chunks)*8+sum(len(chunk) for chunk in address_chunks)
       length_of_address_chunks_bytes = (length_of_address_chunks_bits + 7)//8
-      length_of_balances_bits = len(balances)*merkle_token_contract.num_balance_bits
+      length_of_balances_bits = len(balances)*merkle_token.num_balance_bits
       length_of_balances_bytes = (length_of_balances_bits + 7)//8
-      length_of_hashes_bits = len(proof_hashes)*merkle_token_contract.num_hash_bits
+      length_of_hashes_bits = len(proof_hashes)*merkle_token.num_hash_bits
       length_of_hashes_bytes = (length_of_hashes_bits + 7)//8
       if verbose: print("  sizes: tree_encoding:",length_of_tree_encoding_bytes,\
                       "  addy chunks",length_of_address_chunks_bytes,\
@@ -356,7 +392,7 @@ def test_random_loop():
       calldata = encode_calldata(transactions, balances, address_chunks,proof_hashes,tree_encoding)
 
       # call the contract
-      merkle_token_contract.main(calldata)
+      merkle_token.main(calldata)
 
 
 
@@ -364,7 +400,8 @@ def test_handwritten(case):
 
   # choose a case below
   if case==1:
-    merkle_token_contract.num_address_bits = 4
+    merkle_token.num_address_bits = 4
+    merkle_token.num_address_bytes = (merkle_token.num_address_bits+7)//8
     # all accounts and their balances
     accounts = { \
       '0010': 2, \
@@ -391,15 +428,41 @@ def test_handwritten(case):
     transactions = [ ]
     sorted_addresses = ['0010','1010','1111']
   elif case==2:
-    merkle_token_contract.num_address_bits = 4
+    merkle_token.num_address_bits = 4
+    merkle_token.num_address_bytes = (merkle_token.num_address_bits+7)//8
     accounts = {'1111': 30, '0011': 19, '1000': 23, '1011': 0, '1001': 18, '0001': 13, '0010': 25}
     transactions = [ ]
     sorted_addresses = ['0010', '0011', '1000', '1001', '1011', '1111']
   elif case==3:
-    merkle_token_contract.num_address_bits = 4
+    merkle_token.num_address_bits = 4
+    merkle_token.num_address_bytes = (merkle_token.num_address_bits+7)//8
     accounts = {'1001': 3, '1010': 11, '0111': 4, '1011': 8, '0101': 19, '1000': 21, '1111': 12, '0001': 20}
     transactions = [ ]
     sorted_addresses = ['0111', '1000', '1001', '1011', '1111']
+  elif case==4:
+    merkle_token.num_address_bits = 4
+    merkle_token.num_address_bytes = (merkle_token.num_address_bits+7)//8
+    accounts = {'1000': 15680198381451287781, '0101': 15153962711451731809, '0010': 2045214529773071571, '1010': 2440942951611918511, '0111': 13184077568327963006}
+    transactions = [ ]
+    sorted_addresses = ['0010', '0111', '1000', '1010']
+  elif case==5:
+    merkle_token.num_address_bits = 4
+    merkle_token.num_address_bytes = (merkle_token.num_address_bits+7)//8
+    accounts={'1011': 8938256444143492206, '0111': 7815384352756830268, '0010': 9730086830208173111, '1101': 900156042085247510, '0100': 2736464869549539395, '0000': 10124408162674135124, '1111': 17564933267269664189}
+    transactions = [ ]
+    sorted_addresses = ['0000', '0100', '0111', '1101']
+  elif case==6:
+    merkle_token.num_address_bits = 4
+    merkle_token.num_address_bytes = (merkle_token.num_address_bits+7)//8
+    accounts={'0011': 1717550796369595821, '1010': 2179697818989203640, '1011': 16448714579139372091, '0101': 5707742151784323691, '1111': 2000623183052550128, '0110': 7490042243900540407, '0001': 12339517053306537546}
+    transactions = [ ]
+    sorted_addresses = ['0001', '0011', '0101', '0110']
+  elif case==7:
+    merkle_token.num_address_bits = 5
+    merkle_token.num_address_bytes = (merkle_token.num_address_bits+7)//8
+    accounts={'00011': 17119406195254483079, '11010': 3899075762303900198, '10011': 9486444053537439199, '00111': 5440628254627292198, '10100': 14895533570285341770, '10001': 3019732735682843023}
+    transactions = [ ]
+    sorted_addresses = ['00111', '10011', '10100', '11010']
   else:
     return
 
@@ -419,7 +482,7 @@ def test_handwritten(case):
     print (x,merkle_tree[x])
 
   # init previous state root to be used by contract
-  merkle_token_contract.set_state_root(merkle_tree[''][0])
+  merkle_token.set_state_root(merkle_tree[''][0])
 
   # build the merkle proof
   tree_encoding = []
@@ -436,17 +499,15 @@ def test_handwritten(case):
 
   # encode calldata
   calldata = encode_calldata(transactions, balances, address_chunks,proof_hashes,tree_encoding, sorted_addresses=sorted_addresses)
-  print("calldata has length",len(calldata),calldata)
+  print("calldata has length",len(calldata),calldata.hex())
   decode_calldata(calldata)
   
   # call the contract
-  #merkle_token_contract.main(calldata)
-
+  #merkle_token.main(calldata)
 
 
 if __name__ == "__main__":
   # uncomment one of these
-  #test_random()
+  test_random()
   #test_random_loop()
-  test_handwritten(1)
-
+  #test_handwritten(7)

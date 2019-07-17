@@ -17,6 +17,8 @@
     along with c_ewasm_contracts.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+#ifndef EWASM_H
+#define EWASM_H
 
 
 ///////////
@@ -28,22 +30,24 @@ typedef unsigned short uint16_t;
 typedef unsigned int uint32_t;
 typedef unsigned long long uint64_t;
 
+#ifdef NATIVE
+#else
 typedef char int8_t;
+typedef long long int64_t;
+#endif
 typedef short int16_t;
 typedef int int32_t;
-typedef long long int64_t;
+
+#define NULL (void*)0	//TODO: check how libc defines NULL, I think this affects many things
 
 typedef unsigned long size_t;
-
-#define NULL 0	//TODO: check how libc defines NULL, I think this affects many things
-
 
 //////////////////////////
 // Types For Wasm Stuff //
 //////////////////////////
 
-typedef int32_t i32; // same as i32 in WebAssembly
-typedef int64_t i64; // same as i64 in WebAssembly
+typedef uint32_t i32; // same as i32 in WebAssembly
+typedef uint64_t i64; // same as i64 in WebAssembly
 
 
 
@@ -74,13 +78,26 @@ long long __multi3 (long long a, long long b){
 ////////////////////////////
 
 
-void eth2_loadPreStateRoot(const uint32_t* offset);
+
+void eth2_loadPreStateRoot(uint32_t* offset);
 uint32_t eth2_blockDataSize();
 //void eth2_blockDataCopy(const uint32_t* outputOfset, uint32_t offset, uint32_t length);
-void eth2_blockDataCopy(uint32_t offset, uint32_t length, uint32_t* outputOfset);
-void eth2_savePostStateRoot(const uint32_t* offset);
+void eth2_blockDataCopy(uint32_t* outputOfset, uint32_t offset, uint32_t length);
+void eth2_savePostStateRoot(uint32_t* offset);
 //void eth2_pushNewDeposit(const uint32_t* offset, uint32_t length);
 void eth2_pushNewDeposit(uint32_t* offset, uint32_t length);
+
+#ifdef NATIVE
+/*
+void eth2_loadPreStateRoot(uint32_t* offset){return;}
+uint32_t eth2_blockDataSize(){return 1;}
+//void eth2_blockDataCopy(const uint32_t* outputOfset, uint32_t offset, uint32_t length);
+void eth2_blockDataCopy(uint32_t offset, uint32_t length, uint32_t* outputOfset){return;}
+void eth2_savePostStateRoot(const uint32_t* offset){return;}
+//void eth2_pushNewDeposit(const uint32_t* offset, uint32_t length);
+void eth2_pushNewDeposit(uint32_t* offset, uint32_t length){return;}
+*/
+#endif
 
 
 
@@ -115,26 +132,26 @@ extern unsigned char __data_end;	// data_end is immutable position in memory up 
 extern unsigned long __builtin_wasm_memory_grow(int, unsigned long);	// first arg is mem idx 0, second arg is pages
 extern unsigned long __builtin_wasm_memory_size(int);	// arg must be zero until more memory instances are available
 
-/*
-sample uses:
-  unsigned char* heap_base = &__heap_base;
-  unsigned char* data_end = &__data_end;
-  unsigned int memory_size = __builtin_wasm_memory_size(0);
-*/
+// sample uses:
+//  unsigned char* heap_base = &__heap_base;
+//  unsigned char* data_end = &__data_end;
+//  unsigned int memory_size = __builtin_wasm_memory_size(0);
 
 
+#ifdef NATIVE
+#include<stdlib.h> //malloc
+#include<string.h> //memcpy
+#else
 __attribute__ ((noinline))
 void* malloc(const size_t size){
-  /*
-    Our malloc is naive: we only append to the end of the previous allocation, starting at data_end. This is tuned for short runtimes where memory management cost is expensive, not many things are allocated, or not many things are freed.
-    It seems (in May 2019) that LLVM->Wasm starts data_end at 1024 plus anything that is statically stored in memory at compile-time. So our heap starts at data_end and grows upwards.
-    WARNING: There is a bug. LLVM may output code which uses a stack which grows down from `heap_base`. If this is the case, then heap and stack can collide. We are still evaluating our options, but for now, we leave this because it is memory efficient.
-  */
+  //  Our malloc is naive: we only append to the end of the previous allocation, starting at data_end. This is tuned for short runtimes where memory management cost is expensive, not many things are allocated, or not many things are freed.
+  //  It seems (in May 2019) that LLVM->Wasm starts data_end at 1024 plus anything that is statically stored in memory at compile-time. So our heap starts at data_end and grows upwards.
+  //  WARNING: There is a bug. LLVM may output code which uses a stack which grows down from `heap_base`. If this is the case, then heap and stack can collide. We are still evaluating our options, but for now, we leave this because it is memory efficient.
 
   // this heap pointer starts at data_end and always increments upward
   static uint8_t* heap_ptr = &__data_end;
 
-  uint32_t total_bytes_needed = (uint32_t)(heap_ptr)+size;
+  uint32_t total_bytes_needed = ((uint32_t)heap_ptr)+size;
   // check whether we have enough memory, and handle if we don't
   if (total_bytes_needed > __builtin_wasm_memory_size(0)*PAGE_SIZE){ // if exceed current memory size
     #if GROWABLE_MEMORY==true
@@ -149,10 +166,12 @@ void* malloc(const size_t size){
   heap_ptr = (uint8_t*)total_bytes_needed;
   return (void*)(heap_ptr-size);
 
+
 }
 
 __attribute__ ((noinline))
 void* memcpy(void* restrict destination, const void* restrict source, size_t len) {
+  // TODO: do this in 64-bit chunks, then 8-bit chunks at end
   uint8_t* destination_ptr = (uint8_t*) destination;
   uint8_t* source_ptr = (uint8_t*) source;
   while (len-- > 0) {
@@ -163,6 +182,7 @@ void* memcpy(void* restrict destination, const void* restrict source, size_t len
 
 __attribute__ ((noinline))
 void* memset(void* restrict in, int c, size_t len) {
+  // TODO: do this in 64-bit chunks, then 8-bit chunks at end
   uint8_t* in_ptr = (uint8_t*)in;
   while (len-- > 0) {
     *in_ptr++ = c;
@@ -172,6 +192,7 @@ void* memset(void* restrict in, int c, size_t len) {
 
 __attribute__ ((noinline))
 int memcmp ( const void * in1, const void * in2, size_t num ){
+  // TODO: do this in 64-bit chunks, then 8-bit chunks at end
   uint8_t* in1_ptr = (uint8_t*) in1;
   uint8_t* in2_ptr = (uint8_t*) in2;
   int ret=0;
@@ -186,6 +207,7 @@ int memcmp ( const void * in1, const void * in2, size_t num ){
   }
   return ret;
 }
+#endif
 
 
 ///////////
@@ -241,4 +263,6 @@ i64 reverse_bytes_64(i64 a){
 
 // for testing, can export start fuction
 //void _start(){  _main(); }
+
+#endif
 

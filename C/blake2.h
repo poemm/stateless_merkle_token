@@ -21,6 +21,7 @@ this file has chunks copied from:
 
 
 
+#include "ewasm.h"
 
 
 

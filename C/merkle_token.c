@@ -1,3 +1,4 @@
+
 /*
     Copyright 2019 Paul Dworzanski et al.
 
@@ -26,249 +27,324 @@ make
 
 # to test with scout:
 path/to/scout/target/debug/phase2-scout test.yaml
+~/repos/ethereum/scout_git_20190715/target/release/phase2-scout test.yaml
 
 */
 
-// stuff from stdint.h
-typedef unsigned char uint8_t;
-typedef unsigned short uint16_t;
-typedef unsigned int uint32_t;
-typedef unsigned long long uint64_t;
-typedef char int8_t;
-typedef short int16_t;
-typedef int int32_t;
-typedef long long int64_t;
-typedef unsigned long size_t;
+#include "ewasm.h"
+#include "blake2.h"
+
+#ifdef NATIVE
+#include<stdio.h>
+#include<stdlib.h> //malloc
+#include<string.h> //memcpy
+#endif
 
 
 
-//#include "ewasm.h"
-//#include "blake2.h"
-
-///////////
-// Types //
-///////////
-
-typedef unsigned char uint8_t;
-typedef unsigned short uint16_t;
-typedef unsigned int uint32_t;
-typedef unsigned long long uint64_t;
-
-typedef char int8_t;
-typedef short int16_t;
-typedef int int32_t;
-typedef long long int64_t;
-
-typedef unsigned long size_t;
-
-#define NULL 0  //TODO: check how libc defines NULL, I think this affects many things
-
-
-//////////////////////////
-// Types For Wasm Stuff //
-//////////////////////////
-
-typedef int32_t i32; // same as i32 in WebAssembly
-typedef int64_t i64; // same as i64 in WebAssembly
-
-
-
-//////////////////////////////
-// Types for Ethereum Stuff //
-//////////////////////////////
-
-typedef uint8_t* bytes; // an array of bytes with unrestricted length
-typedef uint8_t bytes32[32]; // an array of 32 bytes
-typedef uint8_t address[20]; // an array of 20 bytes
-typedef unsigned __int128 u128; // a 128 bit number, represented as a 16 bytes long little endian unsigned integer in memory, not sure if this works
-//typedef uint256_t u256; // a 256 bit number, represented as a 32 bytes long little endian unsigned integer in memory, doesn't work
-typedef uint32_t i32ptr; // same as i32 in WebAssembly, but treated as a pointer to a WebAssembly memory offset
-// ethereum interface functions
-
-////////////////////////////
-// EEI Method Declaration //
-////////////////////////////
-
-
-void eth2_loadPreStateRoot(const uint32_t* offset);
-uint32_t eth2_blockDataSize();
-//void eth2_blockDataCopy(const uint32_t* outputOfset, uint32_t offset, uint32_t length);
-void eth2_blockDataCopy(uint32_t offset, uint32_t length, uint32_t* outputOfset);
-void eth2_savePostStateRoot(const uint32_t* offset);
-//void eth2_pushNewDeposit(const uint32_t* offset, uint32_t length);
-void eth2_pushNewDeposit(uint32_t* offset, uint32_t length);
-
-
-////////////////////////////
-// Memory Managment Stuff //
-////////////////////////////
-
-#define PAGE_SIZE 65536
-#define GROWABLE_MEMORY true    // whether we want memory to be growable; true/false
-
-extern unsigned char __heap_base;       // heap_base is immutable position where their model of heap grows down from, can ignore
-extern unsigned char __data_end;        // data_end is immutable position in memory up to where statically allocated things are
-extern unsigned long __builtin_wasm_memory_grow(int, unsigned long);    // first arg is mem idx 0, second arg is pages
-extern unsigned long __builtin_wasm_memory_size(int);   // arg must be zero until more memory instances are available
-
-/*
-sample uses:
-  unsigned char* heap_base = &__heap_base;
-  unsigned char* data_end = &__data_end;
-  unsigned int memory_size = __builtin_wasm_memory_size(0);
-*/
-
-
-__attribute__ ((noinline))
-void* malloc(const size_t size){
-  /*
-    Our malloc is naive: we only append to the end of the previous allocation, starting at data_end. This is tuned for short runtimes where memory management cost is expensive, not many things are allocated, or not many things are freed.
-    It seems (in May 2019) that LLVM->Wasm starts data_end at 1024 plus anything that is statically stored in memory at compile-time. So our heap starts at data_end and grows upwards.
-    WARNING: There is a bug. LLVM may output code which uses a stack which grows down from `heap_base`. If this is the case, then heap and stack can collide. We are still evaluating our options, but for now, we leave this because it is memory efficient.
-  */
-
-  // this heap pointer starts at data_end and always increments upward
-  static uint8_t* heap_ptr = &__data_end;
-
-  uint32_t total_bytes_needed = (uint32_t)(heap_ptr)+size;
-  // check whether we have enough memory, and handle if we don't
-  if (total_bytes_needed > __builtin_wasm_memory_size(0)*PAGE_SIZE){ // if exceed current memory size
-    #if GROWABLE_MEMORY==true
-      uint32_t total_pages_needed = total_bytes_needed/PAGE_SIZE + (total_bytes_needed%PAGE_SIZE)?1:0;
-      __builtin_wasm_memory_grow(0, total_pages_needed - __builtin_wasm_memory_size(0));
-      // note: if we go over the limit of 2^32 bytes of memory, then this memory_grow will trap
-    #else
-      // for conciseness, we do nothing here, but if we access memory outside of bounds, then it will trap
-    #endif
-  }
-
-  heap_ptr = (uint8_t*)total_bytes_needed;
-  return (void*)(heap_ptr-size);
-
-}
-
-
-
-
-
-
+int verbose = 0;
 
 
 // these consts can't just be changed, since parts of the code assume they are unchanged
-const int num_address_bits = 20;
-const int num_hash_bits = 160;
-const int num_balance_bits = 64;
+#define num_address_bits 160
+#define num_hash_bits 160
+#define num_balance_bits 64
+
+#define num_address_bytes (num_address_bits+7)/8
+#define num_hash_bytes (num_hash_bits+7)/8
+#define num_balance_bytes (num_balance_bits+7)/8
 
 
-uint64_t hash_input[] = {0,0,0,0,0,0,0,0};
-uint64_t hash_output_old[] = {0,0,0,0,0};
-uint64_t hash_output_new[] = {0,0,0,0,0};
+// pointers related to merkle proofs, init to 0 otherwise linker has errors
+uint8_t *proof_hashes = 0;
+uint8_t *addresses = 0;
+uint8_t *balances_old = 0;
+uint8_t *balances_new = 0;
+uint8_t *opcodes = 0;
+uint8_t *address_chunks = 0;
 
-uint8_t *proof_hashes;
-uint8_t *addresses;
-uint8_t *balances_old;
-uint8_t *balances_new;
-uint8_t *opcodes;
-uint8_t *address_chunks;
+// this is input to blake2b to hash the leaf, declare here for convenience
+uint64_t leaf_buffer[] = {0,0,0,0,0,0};
+uint64_t *leaf_buffer_balance = (uint64_t*)(((uint8_t*)leaf_buffer)+num_address_bytes);
+
 
 /*
-The hash inputs and outputs are on a stack, with old and new hashes side-by-side
+This function does all of the merklization, in a single-pass, of both old and new root.
 
-  | old hash left | old hash right | new hash left | new hash right |
+The hash inputs and outputs are handled with a stack, with old and new hashes side-by-side.
+A stack item looks like this:
+byte offset:  0               20               40              60               80
+data:         | old hash left | old hash right | new hash left | new hash right |
 
-The hash output is put where the parent wants it.
+The hash output is put in negative indices, where the parent can use it.
 */
-uint8_t *hash_output = 0;
-uint64_t *hash_leaf_input[] = {0,0,0};
-
-
 void merkleize_new_and_old_root(int depth, uint8_t *hash_stack_ptr, int leftFlag){
+  #ifdef NATIVE
+  if(verbose) printf("merkleize_new_and_old_root(%d)\n",depth);
+  #endif
+  // compute the offset to put the resulting hash for this node
   uint8_t* old_hash_output_ptr = hash_stack_ptr - (leftFlag?80:60);
   uint8_t* new_hash_output_ptr = hash_stack_ptr - (leftFlag?40:20);
+  // if we are at a leaf, then hash it and return
   if (depth == num_address_bits){
+    #ifdef NATIVE
+    if(verbose) printf("merkleize_new_and_old_root(%d)  leaf\n",depth);
+    #endif
+    // fill buffer with address
+    memcpy(leaf_buffer,addresses,num_address_bytes);
+    //memcpy(leaf_buffer+num_address_bytes,balances_old,num_balance_bytes);
+    memcpy(leaf_buffer_balance,balances_old,num_balance_bytes);
+    #ifdef NATIVE
+    if(verbose) printf("merkleize_new_and_old_root(%d)  leaf  ptrs:%d %d\n",depth,(uint32_t)leaf_buffer,(uint32_t)leaf_buffer_balance);
+    #endif
+    //*(uint64_t*)leaf_buffer = *(uint64_t*)addresses;
+    //*(uint64_t*)(leaf_buffer+8) = *(uint64_t*)(addresses+8);
+    //*(uint32_t*)(leaf_buffer+16) = *(uint32_t*)(addresses+16);
+    // fill buffer with old value, then hash
+    //*(uint64_t*)(leaf_buffer+20) = *(uint64_t*)(balances_old);
+    blake2b( old_hash_output_ptr, num_hash_bytes, leaf_buffer, num_address_bytes+num_balance_bytes, NULL, 0 );
+    #ifdef NATIVE
+    if(verbose){
+      printf("merkleize_new_and_old_root(%d)  leaf  hashing\n  ",depth);
+      for (int i=0;i<num_address_bytes+num_balance_bytes;i++)
+        printf("%02x ",((uint8_t*)leaf_buffer)[i]);
+      printf(" -> ");
+      for (int i=0;i<num_hash_bytes;i++)
+        printf("%02x ",old_hash_output_ptr[i]);
+      printf("\n");
+    }
+    #endif
+    // fill buffer with new value, then hash
+    //*(uint64_t*)(leaf_buffer+20) = *(uint64_t*)(balances_new);
+    //memcpy(leaf_buffer+num_address_bytes,balances_new,num_balance_bytes);
+    memcpy(leaf_buffer_balance,balances_new,num_balance_bytes);
+    blake2b( new_hash_output_ptr, num_hash_bytes, leaf_buffer, num_address_bytes+num_balance_bytes, NULL, 0 );
+    #ifdef NATIVE
+    if(verbose){
+      printf("merkleize_new_and_old_root(%d)  leaf  hashing\n  ",depth);
+      for (int i=0;i<num_address_bytes+num_balance_bytes;i++)
+        printf("%02x ",((uint8_t*)leaf_buffer)[i]);
+      if(verbose) printf(" -> ");
+      for (int i=0;i<num_hash_bytes;i++)
+        printf("%02x ",new_hash_output_ptr[i]);
+      printf("\n");
+    }
+    #endif
     // increment pointers to next address and next balances
-    addresses += num_address_bits/8;
+    addresses += num_address_bytes;
     balances_old += num_balance_bits/8;
     balances_new += num_balance_bits/8;
-    // fill input with old data, then hash
-    *(uint64_t*)hash_leaf_input = *(uint64_t*)addresses;
-    *(uint64_t*)(hash_leaf_input+8) = *(uint64_t*)(addresses+8);
-    *(uint32_t*)(hash_leaf_input+16) = *(uint32_t*)(addresses+16);
-    *(uint64_t*)(hash_leaf_input+20) = *(uint64_t*)(balances_old);
-    //blake2b( old_hash_output_ptr, num_hash_bits/8, hash_leaf_input, (num_address_bits+num_balance_bits)/8, NULL, 0 );
-    // fill hashing input with new data, then hash
-    *(uint64_t*)(hash_leaf_input+20) = *(uint64_t*)(balances_new);
-    //blake2b( new_hash_output_ptr, num_hash_bits/8, hash_leaf_input, (num_address_bits+num_balance_bits)/8, NULL, 0 );
     return;
   }
   uint8_t opcode = *opcodes;
   opcodes++;
-  int addy_chunk_bit_length;
+  uint8_t addy_chunk_bit_length, addy_chunk_byte_length;
   switch (opcode){
     case 0:
       // get address chunk
-      addy_chunk_bit_length = (int) *address_chunks;
+      addy_chunk_bit_length = *address_chunks;
+      addy_chunk_byte_length = (addy_chunk_bit_length+7)/8;
+      #ifdef NATIVE
+      if(verbose) printf("merkleize_new_and_old_root(%d)  opcode:%d  addy_chunk_bit_length:%d\n",depth,opcode,addy_chunk_bit_length);
+      #endif
+      address_chunks += 1 + addy_chunk_byte_length;
       // recurse with updated depth, same hash_stack_ptr and leftFlag
       merkleize_new_and_old_root(depth+addy_chunk_bit_length, hash_stack_ptr, leftFlag);
       break;
     case 1:
-      // get hash from calldata, put in in both old and new left slots
-      *(uint64_t*)hash_stack_ptr = *(uint64_t*)proof_hashes;
-      *(uint64_t*)(hash_stack_ptr+8) = *(uint64_t*)(proof_hashes+8);
-      *(uint32_t*)(hash_stack_ptr+16) = *(uint32_t*)(proof_hashes+16);
-      *(uint64_t*)(hash_stack_ptr+40) = *(uint64_t*)proof_hashes;
-      *(uint64_t*)(hash_stack_ptr+40+8) = *(uint64_t*)(proof_hashes+8);
-      *(uint32_t*)(hash_stack_ptr+40+16) = *(uint32_t*)(proof_hashes+16);
-      proof_hashes += 20;
       // recurse on right
+      #ifdef NATIVE
+      if(verbose) printf("merkleize_new_and_old_root(%d)  opcode:%d recursing right\n",depth,opcode);
+      #endif
       merkleize_new_and_old_root(depth+1, hash_stack_ptr+80, 0);
+      #ifdef NATIVE
+      if(verbose) printf("merkleize_new_and_old_root(%d)  opcode:%d recursing right done\n",depth,opcode);
+      #endif
+      // get hash from calldata, put in in both old and new left slots
+      memcpy(hash_stack_ptr,proof_hashes,num_hash_bytes);
+      #ifdef NATIVE
+      if(verbose){
+        printf("getting hashing value to memory 1");
+        for (int i=0;i<num_hash_bytes;i++)
+          printf("%02x ",hash_stack_ptr[i]);
+        printf("\n");
+      }
+      #endif
+      //*(uint64_t*)hash_stack_ptr = *(uint64_t*)proof_hashes;
+      //*(uint64_t*)(hash_stack_ptr+8) = *(uint64_t*)(proof_hashes+8);
+      //*(uint32_t*)(hash_stack_ptr+16) = *(uint32_t*)(proof_hashes+16);
+      memcpy(hash_stack_ptr+40,proof_hashes,num_hash_bytes);
+      #ifdef NATIVE
+      if(verbose){
+        printf("getting hashing value to memory 2");
+        for (int i=0;i<num_hash_bytes;i++)
+          printf("%02x ",hash_stack_ptr[40+i]);
+        printf("\n");
+      }
+      #endif
+      //*(uint64_t*)(hash_stack_ptr+40) = *(uint64_t*)proof_hashes;
+      //*(uint64_t*)(hash_stack_ptr+40+8) = *(uint64_t*)(proof_hashes+8);
+      //*(uint32_t*)(hash_stack_ptr+40+16) = *(uint32_t*)(proof_hashes+16);
+      proof_hashes += num_hash_bytes;
       // finally hash old and new
-      //blake2b( old_hash_output_ptr, num_hash_bits/8, hash_stack_ptr, (num_hash_bits/8)*2, NULL, 0 );
-      //blake2b( new_hash_output_ptr, num_hash_bits/8, hash_stack_ptr+40, (num_hash_bits/8)*2, NULL, 0 );
-      break;
+      blake2b( old_hash_output_ptr, num_hash_bytes, hash_stack_ptr, num_hash_bytes*2, NULL, 0 );
+      blake2b( new_hash_output_ptr, num_hash_bytes, hash_stack_ptr+40, num_hash_bytes*2, NULL, 0 );
+      #ifdef NATIVE
+      if(verbose){
+        printf("merkleize_new_and_old_root(%d) %d hashing\n  ",depth,opcode);
+        for (int i=0;i<num_hash_bytes*2;i++)
+          printf("%02x ",((uint8_t*)hash_stack_ptr)[i]);
+        printf(" -> ");
+        for (int i=0;i<num_hash_bytes;i++)
+          printf("%02x ",old_hash_output_ptr[i]);
+        printf("\n");
+        for (int i=0;i<num_hash_bytes*2;i++)
+          printf("%02x ",((uint8_t*)(hash_stack_ptr+40))[i]);
+        printf(" -> ");
+        for (int i=0;i<num_hash_bytes;i++)
+          printf("%02x ",new_hash_output_ptr[i]);
+        if(verbose) printf("\n");
+      }
+      #endif
+        break;
     case 2:
       // recurse on left
+      #ifdef NATIVE
+      //if(verbose) printf("merkleize_new_and_old_root(%d)  opcode:%d recursing left\n",depth,opcode);
+      #endif
       merkleize_new_and_old_root(depth+1, hash_stack_ptr+80, 1);
+      #ifdef NATIVE
+      if(verbose) printf("merkleize_new_and_old_root(%d)  opcode:%d recursing left done\n",depth,opcode);
+      #endif
       // get hash from calldata, put in in both old and new right slots
-      *(uint64_t*)(hash_stack_ptr+20) = *(uint64_t*)proof_hashes;
-      *(uint64_t*)(hash_stack_ptr+20+8) = *(uint64_t*)(proof_hashes+8);
-      *(uint32_t*)(hash_stack_ptr+20+16) = *(uint32_t*)(proof_hashes+16);
-      *(uint64_t*)(hash_stack_ptr+20+40) = *(uint64_t*)proof_hashes;
-      *(uint64_t*)(hash_stack_ptr+20+40+8) = *(uint64_t*)(proof_hashes+8);
-      *(uint32_t*)(hash_stack_ptr+20+40+16) = *(uint32_t*)(proof_hashes+16);
-      proof_hashes += 20;
+      memcpy(hash_stack_ptr+20,proof_hashes,num_hash_bytes);
+      #ifdef NATIVE
+      if(verbose){
+        printf("getting hashing value to memory 3");
+        for (int i=0;i<num_hash_bytes;i++){
+          printf("%02x ",hash_stack_ptr[20+i]);
+        }
+        printf("\n");
+        for (int i=0;i<num_hash_bytes;i++){
+          printf("%02x ",proof_hashes[i]);
+        }
+        printf("\n");
+      }
+
+      #endif
+      //*(uint64_t*)(hash_stack_ptr+20) = *(uint64_t*)proof_hashes;
+      //*(uint64_t*)(hash_stack_ptr+20+8) = *(uint64_t*)(proof_hashes+8);
+      //*(uint32_t*)(hash_stack_ptr+20+16) = *(uint32_t*)(proof_hashes+16);
+      memcpy(hash_stack_ptr+20+40,proof_hashes,num_hash_bytes);
+      #ifdef NATIVE
+      if(verbose){
+        printf("getting hashing value to memory 4");
+        for (int i=0;i<num_hash_bytes;i++)
+          printf("%02x ",hash_stack_ptr[20+40+i]);
+        printf("\n");
+      }
+      #endif
+      //*(uint64_t*)(hash_stack_ptr+20+40) = *(uint64_t*)proof_hashes;
+      //*(uint64_t*)(hash_stack_ptr+20+40+8) = *(uint64_t*)(proof_hashes+8);
+      //*(uint32_t*)(hash_stack_ptr+20+40+16) = *(uint32_t*)(proof_hashes+16);
+      proof_hashes += num_hash_bytes;
       // finally hash old and new
-      //blake2b( old_hash_output_ptr, num_hash_bits/8, hash_stack_ptr, (num_hash_bits/8)*2, NULL, 0 );
-      //blake2b( new_hash_output_ptr, num_hash_bits/8, hash_stack_ptr+40, (num_hash_bits/8)*2, NULL, 0 );
+      blake2b( old_hash_output_ptr, num_hash_bytes, hash_stack_ptr, num_hash_bytes*2, NULL, 0 );
+      blake2b( new_hash_output_ptr, num_hash_bytes, hash_stack_ptr+40, num_hash_bytes*2, NULL, 0 );
+      #ifdef NATIVE
+      if(verbose){
+        printf("merkleize_new_and_old_root(%d) %d hashing\n",depth,opcode);
+        for (int i=0;i<num_hash_bytes*2;i++)
+          printf("%02x ",((uint8_t*)hash_stack_ptr)[i]);
+        printf(" -> ");
+        for (int i=0;i<num_hash_bytes;i++)
+          printf("%02x ",old_hash_output_ptr[i]);
+        printf("\n");
+        for (int i=0;i<num_hash_bytes*2;i++)
+          printf("%02x ",((uint8_t*)(hash_stack_ptr+40))[i]);
+        printf(" -> ");
+        for (int i=0;i<num_hash_bytes;i++)
+          printf("%02x ",new_hash_output_ptr[i]);
+        printf("\n");
+      }
+      #endif
       break;
     case 3:
-      // recurse both ways
+      // recurse both left and right
+      #ifdef NATIVE
+      if(verbose)printf("merkleize_new_and_old_root(%d)  opcode:%d recursing left\n",depth,opcode);
+      #endif
       merkleize_new_and_old_root(depth+1, hash_stack_ptr+80, 1);
+      #ifdef NATIVE
+      if(verbose){
+        printf("merkleize_new_and_old_root(%d)  opcode:%d recursing left done\n",depth,opcode);
+        printf("merkleize_new_and_old_root(%d)  opcode:%d recursing right\n",depth,opcode);
+      }
+      #endif
       merkleize_new_and_old_root(depth+1, hash_stack_ptr+80, 0);
+      #ifdef NATIVE
+      if(verbose)printf("merkleize_new_and_old_root(%d)  opcode:%d recursing right done\n",depth,opcode);
+      #endif
       // hash what was returned
-      //blake2b( old_hash_output_ptr, num_hash_bits/8, hash_stack_ptr, (num_hash_bits/8)*2, NULL, 0 );
-      //blake2b( new_hash_output_ptr, num_hash_bits/8, hash_stack_ptr+40, (num_hash_bits/8)*2, NULL, 0 );
+      blake2b( old_hash_output_ptr, num_hash_bytes, hash_stack_ptr, num_hash_bytes*2, NULL, 0 );
+      blake2b( new_hash_output_ptr, num_hash_bytes, hash_stack_ptr+40, num_hash_bytes*2, NULL, 0 );
+      #ifdef NATIVE
+      if(verbose){
+        printf("merkleize_new_and_old_root(%d) %d hashing\n  ",depth,opcode);
+        for (int i=0;i<num_hash_bytes*2;i++)
+          printf("%02x ",((uint8_t*)hash_stack_ptr)[i]);
+        printf(" -> ");
+        for (int i=0;i<num_hash_bytes;i++)
+          printf("%02x ",old_hash_output_ptr[i]);
+        printf("\n");
+        for (int i=0;i<num_hash_bytes*2;i++)
+          printf("%02x ",((uint8_t*)(hash_stack_ptr+40))[i]);
+        printf(" -> ");
+        for (int i=0;i<num_hash_bytes;i++)
+          printf("%02x ",new_hash_output_ptr[i]);
+        printf("\n");
+      }
+      #endif
       break;
   }
 }
 
 
-
-
-
-uint8_t pre_state_root[] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+// merkle roots, 32 bytes each
 uint8_t post_state_root[] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+#ifdef NATIVE
+uint8_t pre_state_root[] = {0x3b,0xcc,0x9b,0x62,0x9d,0xbb,0x47,0xae,0xe4,0x47,0xbd,0xee,0x2b,0xc7,0xde,0x58,0xaf,0x48,0x85,0xc1,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
+//uint8_t _calldata[] = {60, 0, 0, 0, 99, 151, 51, 182, 235, 88, 231, 190, 221, 41, 73, 243, 196, 11, 75, 184, 41, 25, 178, 210, 106, 215, 63, 94, 248, 60, 125, 176, 56, 65, 60, 237, 126, 16, 56, 75, 198, 78, 55, 45, 51, 5, 38, 22, 178, 10, 82, 91, 3, 215, 215, 253, 38, 247, 21, 129, 235, 222, 119, 211, 3, 0, 0, 0, 2, 10, 15, 24, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 3, 2, 0, 2, 3, 0, 0, 1, 6, 0, 0, 0, 1, 1, 2, 2, 1, 1};
+//uint8_t _calldata[] = {20, 0, 0, 0, 52, 57, 215, 166, 253, 206, 116, 178, 98, 207, 152, 200, 132, 108, 147, 86, 91, 236, 84, 226, 4, 0, 0, 0, 2, 7, 8, 10, 32, 0, 0, 0, 211, 108, 151, 96, 199, 15, 98, 28, 126, 81, 98, 55, 178, 64, 247, 182, 229, 28, 15, 198, 89, 65, 155, 217, 175, 104, 210, 139, 174, 248, 223, 33, 9, 0, 0, 0, 3, 3, 0, 1, 0, 0, 3, 0, 0, 10, 0, 0, 0, 2, 2, 1, 1, 1, 0, 1, 0, 1, 0};
+//uint8_t _calldata[] = {60, 0, 0, 0, 47, 143, 5, 222, 22, 107, 9, 156, 112, 225, 120, 130, 49, 124, 250, 41, 2, 118, 162, 107, 129, 94, 81, 91, 164, 161, 109, 23, 189, 21, 3, 139, 109, 89, 14, 64, 72, 19, 162, 210, 154, 139, 6, 158, 214, 152, 6, 23, 55, 173, 0, 8, 171, 74, 138, 49, 87, 48, 5, 188, 4, 0, 0, 0, 0, 4, 7, 13, 32, 0, 0, 0, 84, 208, 65, 33, 149, 31, 129, 140, 67, 0, 214, 233, 76, 224, 249, 37, 60, 144, 55, 65, 169, 210, 117, 108, 22, 170, 233, 170, 38, 255, 125, 12, 10, 0, 0, 0, 3, 3, 2, 0, 3, 0, 0, 1, 2, 0, 8, 0, 0, 0, 1, 0, 1, 0, 1, 1, 1, 1};
+//uint8_t _calldata[] = {20, 0, 0, 0, 18, 202, 158, 35, 41, 141, 155, 56, 113, 245, 201, 234, 251, 220, 126, 186, 10, 14, 45, 10, 4, 0, 0, 0, 1, 3, 5, 6, 32, 0, 0, 0, 74, 6, 54, 230, 97, 197, 62, 171, 173, 141, 76, 109, 89, 247, 213, 23, 107, 218, 160, 2, 63, 249, 53, 79, 247, 133, 92, 164, 188, 249, 241, 103, 8, 0, 0, 0, 2, 3, 3, 0, 0, 3, 0, 0, 8, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 0};
+//uint8_t _calldata[] = {40, 0, 0, 0, 129, 80, 202, 4, 7, 42, 52, 198, 195, 176, 201, 117, 117, 27, 138, 75, 194, 95, 115, 107, 69, 71, 115, 35, 11, 20, 127, 83, 33, 212, 128, 90, 172, 74, 115, 91, 118, 224, 253, 19, 4, 0, 0, 0, 7, 19, 20, 26, 32, 0, 0, 0, 38, 100, 3, 104, 146, 254, 128, 75, 223, 61, 183, 248, 154, 158, 166, 131, 74, 140, 195, 188, 220, 144, 183, 206, 38, 154, 117, 100, 191, 76, 28, 54, 10, 0, 0, 0, 3, 0, 1, 0, 3, 3, 1, 0, 0, 0, 10, 0, 0, 0, 1, 0, 2, 3, 1, 1, 2, 0, 3, 2};
+//uint8_t _calldata[] = {68, 22, 0, 0, 25, 210, 178, 15, 248, 226, 53, 215, 219, 157, 105, 252, 223, 55, 10, 228, 186, 153, 91, 106, 213, 16, 249, 219, 29, 4, 90, 70, 91, 228, 31, 221, 188, 70, 173, 253, 250, 166, 206, 245, 20, 5, 33, 172, 156, 198, 147, 78, 171, 63, 173, 69, 16, 81, 220, 134, 64, 119, 125, 66, 30, 34, 103, 242, 136, 40, 114, 146, 178, 17, 80, 153, 183, 142, 210, 146, 133, 157, 107, 206, 138, 138, 29, 232, 161, 135, 210, 23, 205, 20, 161, 142, 143, 22, 127, 243, 2, 252, 219, 243, 226, 128, 143, 11, 190, 150, 223, 177, 7, 107, 97, 180, 187, 170, 75, 190, 255, 41, 16, 233, 131, 244, 146, 49, 136, 150, 170, 155, 171, 24, 227, 168, 77, 82, 114, 205, 239, 130, 169, 131, 144, 2, 76, 136, 61, 199, 136, 134, 74, 6, 162, 35, 163, 166, 204, 220, 40, 38, 147, 221, 123, 218, 77, 251, 26, 25, 68, 180, 234, 168, 85, 138, 52, 111, 138, 171, 150, 242, 155, 77, 209, 81, 92, 47, 55, 134, 99, 180, 116, 178, 13, 155, 193, 0, 247, 80, 24, 238, 178, 148, 238, 109, 79, 91, 7, 176, 239, 81, 187, 80, 44, 131, 205, 224, 58, 147, 237, 153, 105, 15, 46, 9, 159, 186, 15, 188, 77, 58, 155, 117, 181, 95, 161, 21, 106, 136, 14, 131, 180, 92, 99, 233, 212, 138, 80, 217, 60, 2, 143, 159, 187, 67, 112, 93, 48, 196, 145, 102, 37, 194, 128, 174, 113, 226, 148, 184, 109, 107, 183, 6, 231, 17, 196, 154, 32, 140, 170, 58, 244, 242, 252, 237, 37, 65, 131, 100, 144, 189, 160, 132, 220, 227, 155, 107, 185, 17, 47, 132, 23, 84, 172, 18, 42, 228, 219, 34, 167, 155, 50, 100, 170, 120, 62, 169, 145, 163, 234, 61, 157, 103, 66, 154, 24, 248, 121, 105, 13, 54, 235, 71, 161, 155, 43, 161, 133, 170, 243, 169, 208, 22, 50, 8, 244, 200, 191, 197, 40, 122, 95, 162, 80, 197, 49, 132, 115, 13, 195, 74, 133, 124, 236, 13, 93, 94, 193, 16, 167, 131, 67, 190, 236, 227, 198, 232, 67, 69, 33, 17, 77, 130, 252, 160, 39, 42, 33, 238, 178, 21, 108, 130, 219, 17, 9, 19, 171, 226, 122, 88, 215, 68, 153, 54, 234, 237, 39, 56, 210, 124, 47, 111, 44, 195, 67, 146, 227, 60, 194, 168, 156, 38, 206, 144, 186, 166, 192, 30, 1, 169, 247, 119, 36, 50, 66, 4, 226, 72, 236, 212, 101, 225, 36, 8, 71, 50, 59, 72, 17, 16, 17, 99, 151, 96, 253, 221, 188, 165, 99, 231, 14, 54, 76, 148, 12, 102, 6, 125, 85, 143, 225, 91, 241, 70, 114, 251, 7, 160, 121, 210, 121, 47, 215, 175, 8, 128, 195, 1, 89, 49, 213, 30, 199, 44, 149, 16, 128, 61, 186, 21, 13, 28, 27, 20, 140, 101, 132, 117, 163, 36, 122, 254, 63, 125, 221, 11, 67, 158, 33, 152, 161, 133, 29, 237, 123, 150, 198, 245, 77, 6, 203, 195, 192, 252, 73, 90, 142, 236, 14, 30, 160, 79, 217, 158, 249, 246, 13, 181, 111, 207, 71, 141, 90, 222, 6, 26, 53, 173, 187, 180, 85, 166, 65, 156, 29, 152, 237, 202, 119, 27, 171, 218, 168, 48, 117, 151, 249, 105, 147, 93, 136, 49, 250, 229, 193, 71, 138, 135, 252, 65, 201, 10, 183, 125, 248, 102, 53, 111, 211, 221, 178, 78, 155, 136, 231, 77, 32, 128, 160, 89, 99, 165, 187, 88, 242, 117, 189, 84, 253, 148, 55, 26, 219, 192, 114, 178, 47, 10, 38, 20, 174, 237, 8, 121, 111, 3, 251, 172, 226, 226, 167, 156, 188, 144, 42, 92, 96, 186, 32, 105, 125, 107, 28, 148, 47, 188, 208, 72, 3, 11, 112, 39, 17, 20, 64, 187, 232, 115, 124, 171, 120, 66, 215, 219, 102, 168, 84, 230, 239, 141, 100, 142, 242, 49, 139, 114, 157, 176, 95, 230, 252, 125, 58, 125, 130, 237, 20, 206, 30, 218, 67, 181, 13, 34, 163, 119, 132, 9, 74, 200, 72, 19, 108, 139, 5, 104, 13, 194, 234, 207, 66, 131, 234, 188, 31, 221, 136, 122, 201, 201, 75, 243, 144, 170, 154, 216, 168, 231, 229, 83, 97, 52, 79, 214, 206, 53, 235, 59, 52, 70, 235, 170, 31, 16, 52, 149, 225, 58, 165, 207, 123, 34, 65, 114, 71, 220, 125, 254, 34, 213, 83, 152, 180, 170, 16, 232, 240, 239, 29, 216, 12, 74, 154, 176, 73, 41, 47, 7, 226, 122, 7, 133, 191, 17, 39, 36, 190, 70, 158, 102, 50, 16, 160, 170, 96, 76, 100, 130, 125, 33, 89, 19, 18, 63, 136, 164, 77, 143, 113, 254, 194, 145, 88, 208, 105, 14, 52, 38, 249, 253, 229, 214, 249, 111, 61, 170, 49, 28, 97, 188, 148, 80, 13, 135, 111, 222, 178, 46, 221, 81, 97, 157, 185, 240, 238, 64, 51, 59, 113, 219, 213, 162, 235, 2, 48, 237, 236, 210, 84, 8, 39, 234, 114, 209, 34, 54, 219, 237, 25, 63, 64, 153, 187, 40, 41, 221, 145, 85, 175, 3, 242, 181, 121, 3, 133, 73, 50, 252, 205, 199, 108, 45, 148, 23, 184, 157, 68, 57, 12, 196, 168, 38, 134, 247, 200, 240, 230, 45, 108, 140, 158, 206, 139, 35, 117, 191, 242, 157, 63, 130, 193, 228, 18, 227, 16, 73, 35, 136, 106, 51, 32, 118, 118, 2, 12, 48, 100, 138, 73, 39, 134, 149, 67, 213, 97, 169, 98, 255, 125, 172, 23, 37, 194, 189, 172, 104, 39, 120, 118, 163, 177, 110, 134, 252, 47, 166, 92, 122, 68, 237, 28, 93, 19, 142, 97, 60, 83, 85, 79, 120, 216, 148, 89, 70, 123, 207, 218, 36, 13, 120, 16, 125, 104, 62, 121, 235, 145, 95, 143, 41, 78, 154, 175, 255, 208, 229, 41, 152, 245, 249, 131, 196, 54, 132, 33, 65, 166, 28, 93, 249, 163, 48, 144, 146, 225, 180, 199, 193, 14, 22, 127, 193, 109, 230, 185, 100, 165, 95, 244, 135, 129, 23, 27, 207, 113, 109, 72, 59, 127, 43, 218, 212, 159, 14, 241, 96, 141, 28, 173, 214, 245, 41, 87, 67, 120, 125, 236, 27, 117, 111, 106, 107, 227, 35, 124, 157, 239, 122, 115, 74, 112, 5, 22, 140, 93, 135, 198, 61, 235, 71, 199, 5, 17, 42, 238, 31, 65, 192, 191, 154, 86, 110, 89, 177, 230, 245, 165, 71, 76, 110, 42, 115, 188, 69, 245, 192, 113, 207, 42, 213, 206, 15, 12, 23, 161, 59, 198, 217, 118, 38, 70, 189, 92, 195, 45, 255, 237, 185, 36, 201, 38, 191, 139, 183, 187, 157, 134, 180, 163, 142, 127, 194, 151, 220, 243, 19, 215, 125, 14, 170, 200, 203, 252, 213, 62, 13, 242, 1, 173, 252, 19, 133, 10, 137, 55, 172, 57, 188, 155, 226, 1, 36, 51, 254, 206, 3, 77, 106, 87, 86, 213, 117, 170, 13, 118, 26, 129, 17, 28, 244, 17, 108, 16, 214, 215, 143, 210, 11, 16, 58, 201, 206, 122, 97, 142, 15, 252, 74, 223, 110, 148, 61, 93, 2, 242, 208, 208, 187, 203, 221, 185, 112, 12, 96, 55, 24, 168, 108, 100, 80, 57, 27, 190, 127, 199, 171, 98, 90, 74, 194, 55, 191, 116, 52, 47, 209, 180, 154, 230, 67, 18, 132, 46, 226, 230, 3, 190, 149, 164, 214, 143, 46, 76, 204, 208, 157, 169, 101, 228, 34, 24, 65, 251, 118, 90, 25, 20, 119, 52, 238, 57, 32, 134, 1, 209, 228, 36, 133, 59, 155, 121, 87, 57, 10, 99, 183, 83, 148, 14, 209, 243, 71, 208, 29, 171, 251, 87, 98, 104, 64, 95, 211, 202, 185, 202, 229, 141, 153, 93, 209, 71, 181, 157, 155, 19, 254, 186, 158, 26, 222, 202, 96, 242, 111, 165, 144, 133, 134, 169, 85, 83, 7, 69, 204, 39, 88, 146, 22, 216, 67, 76, 73, 136, 209, 45, 192, 101, 21, 236, 146, 221, 163, 163, 86, 13, 149, 44, 97, 131, 69, 72, 128, 84, 99, 177, 27, 227, 9, 46, 79, 236, 249, 197, 159, 191, 252, 79, 224, 191, 32, 5, 105, 163, 138, 81, 149, 187, 122, 32, 38, 240, 148, 35, 52, 164, 119, 192, 227, 219, 201, 147, 231, 149, 190, 110, 210, 236, 115, 235, 236, 137, 191, 191, 143, 29, 70, 248, 140, 208, 113, 255, 207, 59, 140, 33, 206, 74, 28, 85, 125, 153, 111, 143, 112, 50, 216, 129, 107, 234, 203, 162, 237, 200, 55, 151, 152, 24, 141, 187, 205, 17, 110, 115, 48, 220, 225, 189, 170, 33, 17, 77, 160, 69, 8, 173, 21, 241, 225, 196, 59, 231, 89, 244, 123, 101, 200, 231, 92, 110, 98, 178, 206, 55, 49, 206, 79, 244, 220, 218, 143, 9, 127, 87, 40, 200, 219, 121, 206, 210, 58, 172, 90, 200, 83, 58, 179, 153, 248, 144, 62, 46, 170, 201, 234, 109, 19, 152, 115, 42, 225, 185, 239, 95, 51, 89, 52, 245, 140, 40, 27, 210, 98, 68, 189, 22, 58, 173, 7, 16, 36, 94, 85, 74, 252, 19, 12, 173, 185, 158, 72, 99, 19, 75, 92, 102, 17, 206, 113, 239, 250, 70, 252, 53, 88, 228, 240, 152, 196, 83, 14, 68, 211, 196, 105, 78, 125, 69, 196, 249, 177, 251, 223, 92, 253, 95, 122, 65, 13, 46, 97, 1, 35, 99, 102, 194, 214, 195, 246, 189, 35, 51, 230, 167, 89, 143, 88, 71, 13, 59, 76, 229, 22, 69, 41, 113, 152, 36, 199, 110, 254, 125, 62, 66, 182, 49, 34, 40, 51, 164, 184, 16, 215, 172, 76, 83, 133, 206, 90, 178, 136, 133, 39, 107, 99, 66, 87, 147, 138, 135, 135, 176, 119, 201, 240, 46, 15, 29, 157, 137, 69, 112, 101, 173, 53, 179, 125, 93, 25, 174, 25, 247, 64, 235, 219, 146, 90, 92, 151, 145, 230, 75, 19, 28, 25, 126, 241, 54, 21, 216, 36, 230, 117, 36, 217, 220, 122, 201, 189, 162, 23, 248, 9, 150, 94, 53, 8, 13, 208, 21, 66, 246, 53, 238, 163, 195, 166, 196, 111, 32, 85, 143, 57, 51, 28, 156, 195, 165, 239, 245, 147, 219, 2, 49, 121, 46, 177, 6, 175, 254, 223, 175, 203, 164, 119, 58, 147, 139, 108, 214, 126, 134, 46, 94, 135, 31, 12, 125, 150, 51, 141, 186, 186, 69, 119, 110, 214, 120, 232, 76, 118, 248, 254, 208, 101, 88, 110, 233, 100, 138, 202, 219, 134, 88, 243, 44, 8, 231, 84, 240, 48, 18, 229, 46, 202, 15, 193, 72, 232, 41, 100, 50, 208, 70, 116, 178, 30, 38, 139, 104, 143, 198, 191, 140, 122, 255, 91, 110, 183, 17, 5, 115, 249, 103, 97, 100, 253, 70, 8, 228, 251, 234, 240, 131, 168, 191, 26, 140, 43, 142, 104, 114, 195, 160, 21, 243, 3, 24, 92, 19, 61, 26, 35, 235, 160, 44, 253, 254, 9, 189, 210, 161, 139, 90, 89, 15, 187, 108, 13, 95, 181, 67, 184, 201, 214, 243, 26, 220, 34, 92, 74, 197, 171, 134, 45, 162, 250, 237, 0, 163, 157, 166, 118, 210, 184, 94, 242, 143, 143, 240, 130, 200, 2, 99, 14, 223, 116, 245, 191, 104, 127, 52, 1, 181, 82, 166, 37, 107, 42, 82, 75, 64, 158, 192, 253, 143, 134, 19, 96, 0, 91, 61, 0, 27, 50, 2, 142, 65, 204, 22, 213, 187, 167, 255, 102, 120, 128, 225, 28, 64, 118, 76, 80, 90, 101, 172, 154, 58, 220, 100, 214, 129, 10, 138, 95, 225, 158, 235, 58, 245, 220, 15, 127, 118, 89, 120, 61, 97, 250, 149, 75, 70, 20, 175, 117, 42, 23, 207, 240, 32, 253, 220, 234, 75, 240, 40, 42, 78, 58, 207, 220, 101, 174, 57, 210, 94, 132, 220, 88, 87, 43, 131, 192, 225, 62, 229, 165, 173, 254, 68, 133, 22, 2, 204, 86, 101, 202, 57, 206, 100, 137, 108, 27, 180, 232, 145, 240, 233, 83, 47, 14, 226, 249, 155, 170, 200, 184, 237, 98, 65, 246, 167, 158, 229, 131, 5, 253, 20, 18, 48, 137, 22, 140, 182, 217, 170, 0, 115, 47, 61, 214, 48, 220, 66, 34, 11, 80, 251, 73, 5, 232, 193, 142, 221, 140, 135, 156, 104, 52, 31, 161, 51, 23, 125, 217, 228, 27, 227, 158, 165, 116, 133, 251, 115, 29, 25, 65, 24, 42, 59, 180, 113, 170, 64, 75, 187, 200, 195, 117, 1, 160, 204, 73, 186, 155, 83, 47, 241, 181, 17, 17, 170, 28, 222, 26, 235, 53, 57, 188, 32, 62, 108, 26, 175, 98, 57, 65, 47, 208, 159, 113, 245, 55, 220, 71, 255, 147, 66, 215, 195, 44, 202, 241, 148, 109, 13, 33, 110, 71, 26, 126, 129, 245, 183, 21, 216, 178, 233, 32, 127, 74, 110, 51, 38, 107, 165, 251, 145, 152, 82, 223, 255, 154, 3, 160, 207, 139, 62, 36, 194, 99, 75, 135, 197, 191, 54, 17, 57, 48, 40, 17, 168, 79, 233, 207, 255, 192, 246, 81, 168, 19, 228, 72, 28, 176, 213, 11, 13, 166, 201, 243, 14, 178, 37, 153, 157, 60, 223, 235, 250, 3, 209, 121, 53, 104, 20, 199, 64, 21, 194, 43, 231, 40, 87, 198, 238, 237, 116, 157, 103, 126, 141, 14, 78, 216, 69, 78, 241, 192, 106, 129, 23, 155, 40, 165, 254, 157, 68, 245, 147, 233, 66, 75, 180, 134, 203, 240, 202, 249, 225, 169, 172, 205, 167, 145, 152, 16, 64, 197, 0, 150, 221, 218, 146, 90, 105, 25, 215, 157, 253, 226, 51, 118, 129, 220, 68, 154, 223, 38, 202, 217, 242, 136, 97, 56, 129, 92, 230, 16, 28, 51, 192, 10, 160, 94, 165, 216, 222, 161, 151, 204, 177, 165, 202, 28, 131, 107, 33, 0, 110, 237, 42, 140, 188, 97, 200, 102, 214, 192, 164, 76, 146, 226, 14, 206, 142, 11, 106, 5, 29, 11, 185, 241, 159, 128, 100, 96, 197, 101, 53, 33, 52, 62, 104, 183, 22, 137, 7, 43, 189, 240, 230, 180, 141, 78, 58, 135, 135, 176, 43, 220, 241, 209, 179, 159, 71, 58, 86, 239, 192, 184, 11, 140, 206, 87, 249, 30, 229, 167, 94, 4, 113, 164, 238, 50, 55, 230, 122, 115, 161, 252, 214, 159, 68, 184, 234, 221, 13, 134, 222, 169, 96, 15, 173, 200, 226, 248, 74, 246, 73, 234, 217, 26, 214, 196, 84, 153, 6, 120, 204, 235, 190, 145, 21, 125, 18, 238, 1, 23, 3, 30, 129, 232, 115, 10, 190, 40, 163, 129, 134, 131, 68, 81, 0, 35, 165, 198, 165, 195, 150, 99, 68, 13, 63, 11, 108, 223, 44, 25, 148, 80, 192, 248, 150, 28, 11, 2, 254, 13, 102, 40, 156, 116, 60, 175, 56, 241, 228, 138, 59, 107, 112, 206, 176, 96, 198, 14, 113, 166, 85, 0, 114, 130, 231, 119, 244, 110, 254, 169, 198, 110, 101, 181, 93, 185, 122, 104, 175, 210, 207, 102, 30, 138, 62, 235, 65, 102, 237, 162, 251, 165, 83, 47, 173, 107, 147, 145, 226, 162, 171, 151, 198, 238, 18, 106, 205, 195, 57, 118, 120, 236, 214, 29, 151, 87, 223, 87, 63, 255, 151, 49, 252, 207, 6, 193, 24, 47, 225, 2, 122, 90, 71, 80, 86, 138, 230, 42, 110, 110, 218, 77, 84, 103, 196, 68, 98, 19, 100, 40, 48, 28, 242, 210, 170, 162, 255, 81, 120, 242, 227, 27, 69, 17, 35, 44, 230, 229, 221, 173, 5, 22, 66, 0, 94, 44, 218, 207, 254, 63, 239, 115, 159, 238, 106, 177, 103, 156, 30, 62, 11, 146, 197, 13, 59, 144, 198, 241, 220, 80, 154, 27, 88, 210, 231, 69, 68, 81, 111, 142, 152, 232, 224, 30, 39, 167, 171, 202, 91, 193, 122, 138, 10, 71, 150, 190, 30, 122, 9, 122, 63, 90, 206, 182, 7, 129, 220, 45, 67, 241, 92, 186, 5, 62, 167, 17, 85, 179, 124, 119, 109, 120, 200, 143, 133, 82, 225, 172, 152, 72, 215, 225, 78, 66, 69, 148, 191, 22, 56, 77, 255, 149, 212, 59, 42, 211, 17, 69, 173, 15, 167, 32, 124, 156, 64, 57, 73, 185, 33, 160, 104, 88, 243, 180, 93, 138, 122, 209, 241, 78, 18, 38, 242, 38, 145, 163, 188, 19, 135, 28, 98, 219, 250, 0, 110, 64, 37, 5, 100, 147, 76, 200, 202, 228, 198, 74, 35, 220, 172, 82, 230, 9, 112, 201, 8, 143, 57, 194, 144, 216, 243, 76, 126, 10, 70, 139, 144, 167, 217, 143, 58, 65, 254, 0, 160, 196, 208, 174, 142, 55, 225, 31, 152, 141, 180, 225, 21, 24, 38, 43, 235, 184, 219, 243, 153, 220, 191, 106, 91, 125, 38, 203, 155, 237, 217, 3, 105, 253, 51, 242, 179, 23, 125, 46, 156, 197, 15, 72, 154, 141, 167, 35, 237, 0, 91, 144, 204, 218, 162, 178, 205, 120, 199, 220, 116, 40, 31, 156, 229, 249, 139, 212, 104, 171, 84, 42, 234, 249, 64, 34, 254, 144, 202, 41, 173, 157, 120, 25, 205, 194, 20, 212, 202, 18, 59, 209, 166, 38, 225, 114, 50, 186, 64, 22, 240, 244, 35, 37, 60, 209, 136, 246, 188, 141, 216, 82, 220, 118, 3, 216, 143, 208, 198, 241, 103, 111, 148, 245, 223, 83, 27, 133, 131, 225, 206, 239, 43, 210, 33, 17, 121, 123, 127, 187, 208, 29, 79, 187, 150, 6, 68, 13, 172, 41, 91, 106, 118, 174, 213, 165, 17, 56, 81, 169, 124, 142, 236, 81, 66, 192, 131, 249, 171, 159, 195, 98, 99, 34, 35, 219, 163, 194, 235, 234, 11, 100, 160, 69, 90, 169, 6, 11, 226, 230, 25, 37, 91, 77, 23, 76, 251, 23, 52, 195, 30, 197, 105, 66, 214, 200, 185, 36, 176, 106, 176, 228, 70, 107, 180, 171, 192, 41, 38, 228, 234, 95, 171, 196, 109, 164, 240, 215, 152, 123, 125, 46, 251, 119, 108, 51, 168, 183, 103, 197, 46, 44, 78, 225, 3, 90, 60, 100, 177, 128, 17, 9, 222, 246, 124, 243, 96, 70, 22, 133, 157, 171, 45, 175, 115, 141, 49, 2, 42, 122, 213, 52, 224, 169, 10, 230, 120, 36, 120, 93, 31, 76, 177, 2, 125, 119, 151, 103, 45, 184, 119, 199, 40, 129, 247, 8, 239, 118, 230, 201, 105, 195, 81, 170, 135, 120, 84, 176, 247, 37, 6, 46, 148, 69, 40, 220, 61, 238, 1, 170, 191, 230, 205, 114, 69, 195, 38, 38, 2, 212, 215, 247, 202, 206, 2, 179, 86, 78, 207, 125, 55, 126, 184, 186, 82, 99, 32, 186, 128, 20, 208, 239, 36, 87, 182, 214, 142, 31, 254, 19, 41, 199, 182, 233, 146, 201, 232, 90, 89, 87, 52, 8, 180, 104, 85, 165, 84, 234, 113, 158, 178, 26, 37, 141, 124, 88, 226, 41, 55, 214, 188, 242, 170, 211, 227, 113, 134, 166, 216, 164, 112, 116, 189, 166, 99, 192, 0, 223, 33, 117, 21, 161, 12, 21, 44, 138, 81, 13, 178, 204, 177, 2, 175, 203, 183, 49, 65, 134, 142, 193, 150, 170, 16, 34, 157, 66, 45, 178, 65, 3, 238, 253, 21, 179, 153, 121, 20, 24, 133, 230, 42, 78, 74, 125, 21, 125, 50, 204, 231, 219, 201, 109, 37, 90, 193, 174, 95, 166, 2, 73, 165, 26, 219, 228, 63, 15, 117, 53, 96, 109, 223, 194, 236, 94, 110, 223, 30, 205, 187, 159, 67, 79, 10, 160, 165, 250, 235, 173, 89, 87, 170, 135, 247, 132, 40, 133, 28, 159, 99, 139, 18, 143, 107, 162, 126, 103, 253, 51, 254, 200, 178, 53, 147, 212, 138, 80, 154, 141, 159, 246, 63, 217, 166, 53, 117, 95, 126, 100, 187, 76, 105, 80, 241, 18, 227, 234, 86, 182, 84, 53, 98, 132, 94, 232, 50, 202, 130, 218, 198, 62, 180, 19, 44, 27, 191, 176, 115, 162, 155, 201, 241, 249, 248, 216, 53, 197, 132, 27, 72, 112, 85, 248, 222, 130, 38, 5, 48, 195, 3, 105, 197, 232, 37, 148, 80, 2, 161, 229, 171, 217, 12, 170, 252, 2, 16, 77, 162, 26, 135, 128, 115, 52, 249, 191, 85, 24, 64, 172, 138, 66, 24, 205, 243, 215, 207, 155, 182, 223, 20, 163, 89, 13, 61, 145, 137, 177, 68, 117, 177, 143, 161, 174, 220, 240, 183, 8, 241, 73, 87, 125, 216, 246, 14, 212, 128, 35, 235, 137, 101, 128, 188, 93, 91, 11, 108, 171, 139, 105, 138, 135, 101, 22, 3, 88, 125, 97, 15, 64, 45, 0, 70, 43, 228, 211, 223, 132, 221, 59, 77, 10, 160, 30, 51, 180, 127, 147, 126, 139, 61, 211, 222, 229, 150, 126, 73, 84, 182, 135, 94, 162, 224, 71, 96, 205, 64, 216, 166, 163, 219, 180, 131, 224, 160, 32, 64, 93, 62, 100, 139, 6, 155, 237, 124, 199, 222, 35, 57, 132, 204, 10, 147, 149, 133, 221, 253, 78, 183, 132, 152, 33, 94, 103, 122, 100, 181, 64, 246, 16, 249, 55, 36, 119, 75, 148, 63, 85, 133, 176, 177, 39, 83, 159, 232, 105, 74, 239, 53, 202, 140, 187, 4, 44, 8, 145, 68, 26, 169, 58, 114, 120, 131, 86, 32, 60, 182, 35, 151, 66, 55, 239, 181, 217, 68, 157, 12, 229, 105, 115, 224, 47, 11, 160, 69, 37, 48, 95, 74, 144, 116, 49, 24, 188, 83, 175, 184, 159, 16, 244, 182, 238, 123, 187, 133, 138, 122, 139, 96, 151, 150, 25, 198, 184, 69, 244, 26, 88, 151, 54, 175, 156, 116, 52, 67, 125, 84, 59, 21, 123, 128, 94, 131, 137, 250, 130, 154, 57, 203, 219, 136, 132, 163, 164, 183, 245, 10, 154, 162, 16, 180, 206, 102, 123, 150, 161, 162, 245, 62, 1, 12, 106, 189, 31, 82, 202, 46, 128, 134, 27, 207, 13, 184, 102, 235, 10, 191, 105, 122, 79, 190, 237, 21, 14, 196, 36, 210, 179, 53, 149, 96, 13, 150, 34, 126, 108, 45, 4, 45, 250, 127, 83, 89, 12, 145, 81, 154, 255, 230, 203, 226, 230, 25, 7, 219, 208, 145, 137, 10, 70, 28, 234, 11, 37, 140, 178, 115, 49, 135, 86, 253, 64, 153, 56, 240, 28, 53, 36, 3, 101, 254, 240, 155, 204, 190, 33, 133, 174, 222, 26, 149, 64, 34, 175, 125, 1, 134, 168, 128, 234, 188, 46, 15, 188, 143, 21, 13, 43, 209, 222, 253, 105, 213, 140, 55, 222, 43, 54, 198, 56, 84, 46, 40, 189, 21, 208, 25, 94, 162, 63, 102, 32, 163, 224, 177, 36, 255, 137, 212, 136, 247, 161, 121, 121, 188, 67, 183, 226, 72, 244, 205, 60, 168, 181, 70, 87, 90, 73, 169, 204, 31, 10, 67, 254, 140, 37, 54, 238, 209, 187, 181, 250, 176, 203, 234, 233, 244, 140, 223, 162, 165, 115, 214, 15, 200, 20, 51, 141, 156, 136, 21, 79, 78, 119, 27, 120, 55, 132, 6, 90, 37, 94, 228, 79, 223, 23, 112, 27, 237, 122, 41, 59, 250, 88, 207, 35, 180, 51, 208, 139, 77, 24, 80, 116, 100, 83, 84, 47, 170, 195, 80, 136, 235, 179, 129, 1, 119, 127, 99, 92, 225, 76, 223, 91, 122, 69, 53, 213, 134, 26, 206, 192, 199, 117, 55, 241, 251, 120, 67, 152, 56, 62, 165, 203, 188, 179, 172, 45, 172, 100, 246, 236, 183, 175, 192, 7, 96, 230, 63, 47, 20, 115, 4, 148, 60, 127, 213, 253, 85, 223, 238, 61, 229, 147, 89, 100, 187, 122, 109, 145, 189, 246, 128, 26, 9, 72, 192, 220, 106, 232, 203, 86, 29, 203, 152, 35, 26, 250, 91, 26, 187, 85, 89, 25, 112, 247, 204, 181, 30, 59, 64, 67, 218, 41, 22, 234, 106, 138, 209, 134, 190, 123, 114, 197, 250, 180, 231, 142, 208, 239, 167, 151, 221, 111, 212, 119, 87, 29, 14, 95, 33, 139, 82, 77, 232, 52, 162, 182, 132, 190, 103, 175, 50, 119, 88, 118, 171, 183, 197, 238, 15, 151, 45, 230, 134, 64, 20, 136, 152, 39, 98, 28, 37, 8, 171, 21, 236, 86, 249, 106, 198, 152, 74, 131, 55, 156, 123, 237, 145, 42, 169, 151, 249, 253, 77, 98, 12, 42, 237, 76, 141, 43, 30, 50, 159, 38, 122, 191, 34, 112, 9, 231, 17, 200, 65, 246, 167, 191, 140, 220, 141, 133, 107, 155, 89, 11, 227, 102, 12, 237, 192, 192, 197, 20, 201, 167, 214, 251, 56, 80, 59, 141, 16, 39, 109, 183, 197, 109, 13, 167, 34, 236, 62, 38, 239, 157, 135, 190, 134, 223, 156, 203, 141, 244, 82, 54, 247, 127, 49, 33, 57, 198, 219, 6, 10, 75, 223, 231, 115, 244, 208, 204, 49, 111, 185, 66, 120, 31, 17, 238, 0, 221, 37, 106, 9, 193, 188, 92, 88, 49, 108, 145, 24, 106, 154, 69, 140, 101, 105, 25, 72, 157, 178, 242, 220, 15, 49, 41, 155, 171, 174, 8, 115, 2, 155, 182, 75, 206, 166, 237, 208, 156, 18, 131, 33, 115, 39, 21, 117, 229, 160, 166, 151, 245, 189, 120, 11, 210, 176, 130, 118, 199, 11, 84, 146, 71, 236, 16, 214, 223, 44, 163, 34, 213, 228, 151, 0, 4, 72, 123, 199, 87, 72, 22, 206, 114, 210, 63, 42, 14, 37, 15, 215, 135, 153, 101, 189, 232, 254, 171, 202, 13, 250, 95, 70, 167, 82, 25, 136, 45, 8, 235, 16, 202, 214, 62, 178, 85, 149, 229, 189, 236, 241, 162, 196, 122, 148, 252, 78, 37, 157, 151, 26, 26, 171, 43, 19, 136, 39, 215, 253, 36, 33, 219, 119, 27, 112, 80, 197, 220, 208, 10, 104, 252, 11, 59, 238, 199, 47, 210, 89, 13, 178, 72, 86, 38, 190, 138, 98, 135, 220, 195, 63, 196, 141, 171, 86, 255, 19, 115, 202, 211, 108, 100, 100, 170, 220, 250, 193, 218, 235, 71, 190, 62, 8, 53, 225, 96, 97, 45, 218, 196, 36, 134, 228, 183, 16, 213, 46, 77, 163, 123, 9, 219, 28, 191, 202, 27, 193, 122, 101, 106, 108, 149, 10, 174, 84, 161, 215, 163, 25, 120, 85, 167, 67, 74, 202, 225, 74, 36, 212, 48, 15, 175, 206, 135, 153, 245, 23, 186, 48, 83, 8, 53, 134, 123, 28, 30, 41, 231, 140, 109, 179, 133, 150, 91, 239, 93, 70, 57, 232, 114, 214, 25, 158, 219, 209, 140, 190, 174, 80, 90, 242, 159, 186, 177, 74, 65, 41, 111, 84, 205, 174, 87, 69, 96, 99, 236, 210, 219, 110, 16, 212, 230, 50, 102, 59, 105, 43, 87, 98, 237, 236, 46, 36, 101, 34, 215, 134, 148, 235, 28, 239, 222, 18, 210, 183, 167, 128, 153, 118, 16, 255, 28, 167, 211, 162, 220, 145, 26, 101, 197, 36, 215, 203, 181, 155, 108, 135, 80, 59, 1, 72, 40, 137, 142, 171, 154, 242, 206, 91, 93, 122, 183, 248, 225, 199, 128, 73, 33, 76, 208, 32, 133, 42, 56, 35, 70, 7, 205, 117, 73, 250, 34, 79, 143, 85, 123, 58, 150, 215, 20, 99, 2, 117, 247, 7, 93, 5, 159, 197, 145, 4, 115, 111, 53, 147, 113, 54, 29, 192, 101, 115, 152, 173, 13, 131, 167, 109, 247, 125, 110, 188, 204, 153, 31, 243, 223, 247, 60, 147, 33, 3, 67, 51, 110, 248, 188, 51, 115, 224, 108, 79, 238, 150, 101, 10, 218, 138, 217, 227, 160, 28, 209, 229, 138, 70, 178, 132, 62, 147, 252, 192, 102, 164, 67, 205, 52, 73, 206, 90, 18, 74, 86, 106, 159, 20, 179, 47, 57, 52, 133, 163, 155, 180, 44, 1, 13, 106, 142, 5, 141, 0, 59, 22, 122, 234, 32, 95, 45, 187, 39, 238, 12, 107, 135, 58, 60, 2, 85, 88, 240, 127, 186, 61, 254, 180, 27, 46, 43, 24, 107, 17, 249, 30, 226, 219, 173, 128, 101, 239, 224, 194, 224, 111, 45, 128, 34, 199, 237, 186, 90, 57, 18, 51, 19, 89, 203, 145, 72, 199, 181, 186, 36, 157, 32, 2, 62, 198, 160, 227, 176, 240, 115, 199, 168, 104, 82, 83, 230, 58, 244, 222, 191, 119, 217, 40, 66, 84, 223, 89, 245, 1, 226, 173, 237, 59, 68, 112, 181, 211, 220, 79, 244, 190, 163, 201, 151, 54, 73, 136, 111, 38, 235, 118, 130, 111, 206, 205, 13, 240, 57, 141, 89, 182, 190, 157, 12, 248, 141, 184, 7, 105, 52, 52, 162, 174, 19, 24, 96, 34, 243, 67, 149, 49, 126, 38, 164, 73, 242, 125, 85, 173, 67, 81, 107, 33, 118, 75, 194, 8, 13, 158, 81, 200, 250, 107, 64, 243, 31, 143, 109, 53, 50, 226, 72, 206, 115, 222, 34, 224, 105, 118, 86, 125, 19, 121, 128, 242, 116, 228, 24, 255, 76, 167, 194, 111, 249, 152, 151, 150, 124, 95, 76, 170, 4, 123, 43, 98, 180, 115, 138, 133, 26, 55, 197, 249, 244, 122, 23, 106, 120, 203, 177, 210, 155, 175, 232, 67, 191, 154, 200, 71, 79, 32, 202, 148, 185, 154, 11, 177, 96, 174, 54, 159, 105, 232, 33, 37, 174, 178, 97, 243, 4, 3, 96, 105, 254, 71, 22, 18, 213, 57, 5, 255, 21, 16, 181, 231, 141, 65, 98, 97, 16, 171, 231, 76, 60, 73, 111, 89, 212, 227, 12, 244, 129, 80, 112, 152, 94, 98, 228, 130, 214, 78, 55, 91, 60, 27, 85, 69, 56, 89, 67, 153, 28, 84, 121, 254, 136, 91, 145, 243, 179, 61, 254, 198, 182, 79, 21, 129, 51, 240, 154, 45, 7, 206, 227, 16, 221, 111, 14, 74, 223, 160, 106, 56, 226, 30, 197, 143, 47, 129, 203, 210, 77, 55, 11, 13, 80, 120, 124, 12, 43, 121, 151, 157, 211, 98, 168, 24, 40, 254, 79, 243, 33, 78, 241, 167, 43, 146, 232, 31, 18, 251, 170, 224, 58, 198, 233, 239, 120, 129, 163, 6, 170, 221, 174, 155, 247, 12, 137, 86, 3, 217, 18, 205, 62, 165, 24, 14, 145, 157, 141, 8, 238, 157, 179, 35, 254, 175, 95, 222, 116, 24, 182, 16, 221, 81, 87, 245, 124, 196, 133, 181, 204, 133, 48, 86, 51, 179, 242, 158, 210, 231, 39, 203, 142, 244, 202, 81, 123, 173, 35, 151, 123, 119, 38, 51, 176, 94, 197, 109, 105, 35, 64, 167, 135, 107, 97, 17, 172, 29, 177, 72, 17, 87, 170, 49, 135, 23, 175, 84, 179, 105, 242, 121, 229, 140, 116, 8, 224, 124, 93, 135, 209, 254, 16, 54, 18, 123, 164, 98, 27, 215, 185, 87, 86, 1, 57, 235, 231, 34, 19, 8, 7, 8, 129, 89, 229, 19, 223, 181, 117, 11, 245, 98, 49, 224, 187, 161, 76, 157, 71, 230, 17, 228, 221, 137, 14, 107, 160, 52, 99, 159, 179, 184, 223, 77, 113, 64, 88, 28, 29, 228, 242, 58, 2, 182, 79, 145, 247, 253, 255, 161, 153, 15, 13, 15, 8, 103, 12, 36, 172, 40, 142, 238, 3, 53, 107, 206, 195, 35, 111, 110, 180, 104, 191, 52, 17, 209, 168, 79, 142, 46, 124, 92, 254, 22, 208, 13, 152, 63, 251, 32, 31, 34, 185, 158, 23, 111, 231, 105, 17, 111, 145, 123, 245, 114, 18, 48, 183, 237, 211, 106, 173, 228, 255, 79, 150, 213, 235, 230, 133, 218, 157, 201, 69, 235, 99, 89, 138, 203, 99, 31, 18, 230, 238, 57, 0, 132, 24, 88, 125, 230, 127, 97, 204, 165, 9, 54, 114, 0, 224, 31, 32, 90, 175, 252, 118, 165, 30, 88, 187, 163, 6, 133, 144, 101, 216, 170, 244, 241, 46, 124, 60, 98, 148, 70, 102, 56, 160, 20, 84, 198, 221, 239, 233, 32, 189, 129, 144, 155, 65, 233, 235, 207, 30, 211, 166, 237, 74, 131, 196, 124, 105, 11, 199, 119, 106, 137, 122, 37, 116, 66, 7, 12, 200, 6, 216, 18, 247, 100, 217, 168, 111, 53, 222, 247, 129, 10, 80, 156, 89, 28, 151, 212, 245, 193, 1, 86, 195, 155, 170, 192, 74, 210, 115, 45, 27, 85, 210, 65, 46, 181, 176, 240, 70, 76, 187, 47, 16, 122, 29, 34, 216, 226, 193, 186, 255, 141, 163, 162, 191, 255, 87, 64, 105, 73, 65, 247, 150, 223, 79, 2, 64, 105, 238, 223, 171, 85, 65, 156, 233, 174, 25, 209, 236, 43, 60, 212, 244, 8, 248, 30, 116, 84, 180, 255, 16, 194, 128, 17, 228, 180, 230, 188, 237, 75, 97, 13, 186, 53, 45, 144, 247, 104, 189, 205, 180, 72, 86, 116, 237, 106, 16, 222, 148, 128, 240, 204, 245, 157, 253, 121, 159, 130, 53, 111, 125, 134, 29, 40, 66, 132, 196, 160, 250, 199, 69, 168, 186, 223, 56, 78, 174, 154, 221, 254, 48, 179, 130, 233, 214, 211, 211, 16, 193, 196, 160, 101, 99, 182, 152, 146, 158, 47, 49, 75, 189, 43, 19, 237, 238, 192, 43, 215, 233, 196, 129, 56, 58, 204, 22, 204, 43, 220, 200, 36, 23, 232, 94, 191, 129, 158, 221, 214, 102, 217, 92, 103, 97, 205, 232, 95, 226, 222, 111, 231, 46, 164, 1, 47, 142, 21, 186, 43, 11, 224, 197, 118, 155, 229, 218, 226, 152, 244, 180, 111, 98, 107, 164, 91, 209, 178, 159, 40, 172, 108, 0, 42, 184, 144, 1, 0, 0, 1, 203, 139, 135, 171, 165, 220, 139, 208, 201, 234, 148, 178, 215, 84, 33, 76, 103, 92, 11, 2, 237, 230, 227, 239, 197, 4, 131, 119, 218, 207, 2, 43, 164, 128, 173, 50, 30, 233, 249, 17, 10, 25, 202, 69, 189, 82, 159, 131, 188, 24, 210, 18, 111, 50, 173, 131, 39, 53, 132, 21, 96, 68, 242, 106, 137, 58, 95, 229, 232, 165, 223, 117, 224, 68, 230, 208, 27, 230, 117, 21, 163, 29, 66, 165, 37, 130, 80, 183, 8, 178, 9, 112, 104, 123, 114, 230, 84, 218, 240, 34, 29, 139, 236, 129, 190, 147, 116, 71, 169, 105, 166, 216, 166, 123, 59, 26, 122, 41, 203, 97, 55, 245, 249, 133, 112, 171, 44, 14, 71, 41, 245, 131, 40, 161, 201, 167, 43, 153, 61, 105, 65, 93, 214, 95, 235, 255, 3, 241, 183, 81, 198, 64, 122, 156, 24, 214, 19, 227, 135, 106, 24, 246, 205, 144, 76, 24, 209, 167, 248, 75, 191, 212, 90, 190, 229, 208, 144, 246, 99, 142, 157, 195, 167, 113, 211, 242, 243, 216, 143, 28, 58, 222, 177, 30, 239, 250, 194, 129, 249, 142, 218, 143, 105, 4, 209, 55, 129, 111, 251, 228, 74, 122, 96, 231, 172, 232, 102, 141, 103, 147, 57, 213, 216, 54, 44, 90, 186, 31, 139, 69, 201, 181, 37, 238, 149, 37, 100, 82, 105, 160, 137, 139, 125, 140, 14, 235, 236, 14, 1, 67, 65, 86, 187, 206, 217, 17, 149, 221, 206, 174, 33, 27, 121, 8, 196, 1, 165, 102, 130, 152, 183, 77, 170, 7, 59, 33, 253, 217, 148, 174, 51, 194, 45, 81, 82, 249, 106, 6, 203, 199, 37, 219, 161, 251, 30, 124, 49, 213, 46, 176, 88, 7, 104, 220, 129, 99, 65, 41, 8, 239, 167, 119, 10, 22, 125, 62, 16, 60, 239, 183, 78, 58, 107, 195, 123, 194, 67, 90, 166, 21, 121, 35, 95, 168, 109, 135, 97, 183, 207, 212, 165, 176, 124, 104, 123, 196, 97, 180, 32, 72, 205, 37, 146, 198, 7, 108, 22, 168, 106, 246, 253, 148, 149, 255, 151, 116, 130, 225, 250, 242, 132, 63, 193, 50, 160, 84, 153, 21, 33, 254, 181, 215, 29, 129, 221, 162, 146, 169, 79, 185, 179, 73, 29, 146, 197, 13, 88, 247, 8, 160, 0, 0, 0, 125, 130, 50, 194, 184, 23, 75, 196, 103, 116, 9, 67, 90, 11, 10, 225, 17, 160, 4, 255, 185, 224, 195, 127, 169, 137, 254, 109, 6, 44, 94, 84, 85, 168, 175, 174, 48, 57, 77, 49, 6, 2, 163, 237, 41, 224, 22, 38, 196, 162, 166, 35, 196, 145, 59, 170, 23, 116, 132, 12, 125, 94, 187, 78, 132, 117, 117, 90, 15, 83, 149, 13, 132, 199, 239, 194, 159, 125, 220, 91, 89, 146, 101, 103, 254, 159, 151, 151, 250, 190, 250, 92, 243, 178, 189, 232, 14, 155, 250, 37, 31, 129, 32, 77, 107, 162, 3, 12, 13, 221, 183, 38, 84, 106, 199, 191, 158, 60, 120, 179, 5, 40, 132, 185, 185, 114, 45, 21, 104, 78, 189, 42, 118, 129, 48, 206, 56, 71, 84, 70, 8, 238, 197, 238, 76, 73, 213, 155, 49, 170, 164, 80, 162, 174, 206, 246, 184, 79, 188, 197, 78, 1, 0, 0, 3, 3, 3, 3, 2, 2, 3, 1, 1, 1, 2, 2, 1, 2, 1, 1, 1, 2, 0, 2, 0, 2, 1, 1, 1, 2, 1, 1, 2, 1, 1, 1, 1, 0, 2, 3, 2, 1, 2, 2, 2, 2, 1, 2, 1, 2, 2, 2, 2, 1, 0, 2, 1, 3, 1, 1, 2, 2, 2, 2, 2, 2, 1, 2, 0, 2, 0, 2, 1, 2, 2, 2, 1, 1, 2, 2, 0, 1, 1, 0, 2, 2, 2, 1, 2, 2, 2, 2, 1, 1, 1, 2, 1, 1, 2, 2, 0, 1, 0, 1, 0, 1, 2, 3, 2, 2, 1, 2, 2, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 0, 2, 3, 1, 2, 1, 2, 2, 2, 2, 2, 1, 2, 1, 0, 2, 2, 2, 2, 1, 1, 2, 2, 2, 1, 1, 1, 0, 3, 3, 3, 1, 1, 1, 2, 1, 3, 2, 1, 1, 1, 2, 1, 1, 1, 2, 2, 0, 1, 0, 2, 1, 1, 2, 1, 2, 1, 2, 2, 2, 1, 0, 2, 2, 1, 1, 2, 2, 1, 1, 1, 2, 2, 1, 1, 1, 2, 0, 2, 0, 2, 0, 3, 3, 2, 2, 2, 1, 2, 2, 2, 1, 2, 2, 1, 1, 2, 2, 2, 0, 1, 1, 2, 2, 2, 1, 3, 2, 2, 2, 1, 2, 2, 2, 0, 2, 2, 1, 1, 1, 1, 2, 0, 2, 2, 0, 2, 3, 2, 2, 2, 1, 2, 1, 1, 2, 2, 2, 2, 2, 2, 2, 0, 1, 1, 2, 1, 2, 2, 1, 1, 1, 2, 2, 2, 1, 1, 1, 2, 0, 3, 1, 2, 1, 2, 2, 1, 2, 1, 2, 2, 1, 2, 1, 1, 2, 1, 0, 2, 0, 1, 3, 1, 1, 2, 1, 1, 1, 1, 1, 1, 2, 1, 1, 2, 2, 1, 0, 1, 1, 2, 1, 2, 1, 1, 2, 1, 2, 1, 1, 1, 2, 1, 2, 0, 143, 1, 0, 0, 1, 0, 140, 11, 135, 171, 165, 220, 139, 208, 201, 234, 148, 178, 215, 84, 33, 76, 103, 92, 11, 141, 6, 227, 239, 197, 4, 131, 119, 218, 207, 2, 43, 164, 128, 173, 50, 30, 233, 249, 140, 9, 202, 69, 189, 82, 159, 131, 188, 24, 210, 18, 111, 50, 173, 131, 39, 53, 132, 3, 1, 137, 0, 242, 106, 137, 58, 95, 229, 232, 165, 223, 117, 224, 68, 230, 208, 27, 230, 117, 1, 0, 139, 5, 66, 165, 37, 130, 80, 183, 8, 178, 9, 112, 104, 123, 114, 230, 84, 218, 240, 1, 0, 1, 0, 137, 1, 236, 129, 190, 147, 116, 71, 169, 105, 166, 216, 166, 123, 59, 26, 122, 41, 203, 140, 5, 249, 133, 112, 171, 44, 14, 71, 41, 245, 131, 40, 161, 201, 167, 43, 153, 61, 142, 29, 214, 95, 235, 255, 3, 241, 183, 81, 198, 64, 122, 156, 24, 214, 19, 227, 135, 141, 22, 205, 144, 76, 24, 209, 167, 248, 75, 191, 212, 90, 190, 229, 208, 144, 246, 99, 3, 1, 136, 167, 113, 211, 242, 243, 216, 143, 28, 58, 222, 177, 30, 239, 250, 194, 129, 249, 139, 7, 105, 4, 209, 55, 129, 111, 251, 228, 74, 122, 96, 231, 172, 232, 102, 141, 103, 1, 1, 1, 1, 137, 1, 216, 54, 44, 90, 186, 31, 139, 69, 201, 181, 37, 238, 149, 37, 100, 82, 105, 140, 11, 125, 140, 14, 235, 236, 14, 1, 67, 65, 86, 187, 206, 217, 17, 149, 221, 206, 141, 27, 121, 8, 196, 1, 165, 102, 130, 152, 183, 77, 170, 7, 59, 33, 253, 217, 148, 1, 0, 138, 2, 45, 81, 82, 249, 106, 6, 203, 199, 37, 219, 161, 251, 30, 124, 49, 213, 46, 140, 7, 104, 220, 129, 99, 65, 41, 8, 239, 167, 119, 10, 22, 125, 62, 16, 60, 239, 138, 2, 107, 195, 123, 194, 67, 90, 166, 21, 121, 35, 95, 168, 109, 135, 97, 183, 207, 2, 2, 138, 0, 124, 104, 123, 196, 97, 180, 32, 72, 205, 37, 146, 198, 7, 108, 22, 168, 106, 140, 4, 149, 255, 151, 116, 130, 225, 250, 242, 132, 63, 193, 50, 160, 84, 153, 21, 33, 139, 7, 29, 129, 221, 162, 146, 169, 79, 185, 179, 73, 29, 146, 197, 13, 88, 247, 8};
+
+uint8_t _calldata[] = {184, 26, 0, 0, 150, 2, 10, 12, 105, 86, 117, 49, 214, 41, 215, 236, 83, 142, 28, 97, 0, 96, 38, 203, 122, 78, 173, 191, 68, 3, 28, 99, 254, 93, 123, 214, 71, 182, 49, 81, 113, 249, 63, 175, 165, 181, 213, 96, 96, 177, 147, 198, 111, 177, 208, 29, 251, 184, 142, 64, 45, 225, 206, 229, 32, 87, 77, 136, 177, 176, 144, 187, 67, 234, 223, 66, 156, 13, 200, 245, 86, 132, 178, 248, 92, 96, 191, 199, 22, 30, 194, 19, 239, 28, 140, 58, 81, 35, 112, 205, 193, 79, 62, 47, 252, 81, 158, 253, 36, 137, 160, 98, 163, 18, 133, 133, 248, 47, 112, 196, 214, 83, 60, 145, 45, 202, 109, 232, 72, 11, 148, 100, 187, 135, 46, 137, 82, 160, 246, 56, 82, 120, 192, 217, 185, 106, 87, 64, 212, 151, 177, 75, 113, 62, 78, 151, 203, 55, 39, 167, 186, 225, 233, 98, 37, 17, 150, 92, 119, 66, 124, 34, 13, 40, 243, 20, 61, 109, 168, 109, 226, 143, 54, 152, 52, 125, 181, 34, 130, 124, 238, 33, 32, 207, 99, 185, 213, 2, 118, 120, 150, 104, 202, 153, 166, 25, 242, 128, 42, 90, 68, 10, 19, 247, 117, 221, 209, 119, 244, 203, 96, 98, 2, 87, 123, 200, 245, 176, 56, 15, 154, 50, 10, 77, 208, 69, 121, 189, 23, 184, 218, 127, 213, 61, 140, 6, 40, 102, 219, 223, 161, 20, 184, 43, 203, 231, 9, 157, 243, 34, 72, 20, 120, 70, 115, 72, 240, 178, 57, 154, 178, 127, 218, 169, 82, 245, 73, 189, 220, 118, 130, 75, 159, 95, 126, 228, 40, 115, 199, 113, 181, 214, 161, 180, 201, 169, 11, 35, 232, 0, 247, 46, 148, 66, 31, 130, 114, 227, 163, 204, 188, 97, 79, 201, 190, 224, 185, 238, 1, 22, 37, 45, 77, 57, 240, 70, 184, 133, 98, 183, 61, 234, 181, 204, 150, 29, 93, 201, 160, 233, 54, 159, 36, 157, 209, 152, 81, 247, 20, 75, 147, 246, 133, 118, 115, 110, 137, 0, 166, 18, 152, 59, 218, 206, 79, 185, 150, 71, 241, 175, 129, 193, 142, 58, 90, 149, 59, 162, 189, 46, 228, 53, 166, 147, 105, 175, 90, 17, 8, 224, 44, 246, 94, 188, 221, 62, 146, 33, 171, 77, 225, 82, 217, 193, 181, 245, 73, 209, 11, 240, 177, 48, 26, 51, 136, 54, 114, 215, 87, 114, 55, 207, 56, 70, 10, 71, 120, 92, 84, 44, 135, 224, 239, 40, 136, 130, 133, 177, 13, 197, 80, 241, 94, 216, 82, 4, 164, 69, 132, 203, 124, 72, 79, 222, 47, 188, 145, 217, 58, 234, 0, 20, 136, 79, 242, 234, 162, 190, 145, 194, 95, 102, 213, 238, 50, 40, 223, 32, 55, 215, 35, 198, 91, 200, 38, 140, 77, 25, 106, 103, 221, 124, 189, 239, 224, 103, 109, 106, 85, 92, 36, 71, 114, 255, 31, 37, 48, 156, 80, 6, 98, 206, 249, 83, 82, 151, 91, 161, 175, 136, 218, 56, 199, 151, 197, 171, 227, 156, 64, 199, 170, 6, 34, 88, 4, 55, 67, 58, 42, 162, 169, 151, 204, 202, 138, 180, 100, 5, 217, 45, 61, 168, 56, 32, 204, 95, 246, 150, 95, 14, 156, 91, 14, 116, 39, 150, 57, 143, 81, 130, 105, 113, 163, 112, 94, 232, 227, 9, 127, 114, 22, 232, 249, 51, 8, 45, 80, 110, 203, 23, 104, 183, 31, 197, 171, 38, 180, 89, 255, 209, 185, 161, 191, 150, 176, 244, 205, 86, 248, 63, 71, 76, 166, 172, 61, 34, 202, 90, 144, 168, 14, 251, 133, 110, 203, 164, 166, 35, 92, 100, 252, 69, 69, 71, 168, 191, 32, 42, 116, 54, 214, 203, 182, 2, 36, 22, 107, 132, 90, 208, 100, 20, 243, 178, 184, 39, 50, 212, 252, 128, 199, 77, 161, 105, 44, 49, 219, 128, 127, 202, 230, 114, 196, 19, 16, 177, 245, 23, 39, 188, 99, 196, 111, 54, 153, 253, 26, 217, 105, 235, 127, 245, 184, 182, 162, 31, 32, 25, 240, 68, 41, 212, 89, 85, 138, 81, 87, 49, 59, 74, 169, 251, 74, 159, 92, 14, 92, 80, 220, 222, 147, 85, 7, 155, 246, 193, 204, 175, 5, 146, 168, 165, 17, 205, 158, 43, 25, 6, 85, 246, 199, 52, 183, 249, 29, 89, 3, 8, 203, 63, 3, 104, 99, 5, 113, 182, 211, 75, 193, 105, 24, 60, 103, 118, 44, 49, 123, 112, 143, 218, 239, 224, 177, 59, 14, 88, 133, 16, 150, 47, 202, 92, 209, 171, 39, 217, 149, 186, 220, 145, 82, 185, 208, 193, 224, 87, 95, 5, 50, 6, 48, 230, 212, 218, 122, 35, 119, 45, 188, 238, 224, 72, 0, 102, 148, 101, 6, 159, 190, 187, 178, 157, 138, 7, 149, 94, 201, 31, 9, 10, 152, 93, 208, 110, 207, 188, 174, 236, 22, 47, 60, 75, 68, 135, 2, 207, 225, 253, 153, 233, 131, 35, 227, 99, 174, 165, 73, 152, 72, 37, 136, 219, 70, 111, 240, 41, 178, 175, 130, 59, 230, 32, 156, 159, 28, 91, 131, 237, 208, 173, 141, 57, 114, 184, 157, 132, 174, 3, 246, 234, 41, 23, 118, 101, 150, 194, 107, 218, 32, 236, 43, 115, 35, 172, 28, 19, 210, 91, 243, 198, 128, 2, 130, 221, 46, 199, 248, 208, 40, 47, 138, 108, 54, 96, 61, 79, 174, 149, 131, 60, 20, 201, 67, 255, 8, 157, 95, 115, 233, 94, 121, 115, 26, 124, 67, 192, 102, 177, 68, 225, 197, 127, 113, 90, 17, 32, 195, 16, 62, 27, 241, 154, 243, 190, 47, 166, 239, 2, 8, 128, 227, 238, 12, 192, 151, 15, 216, 66, 239, 91, 213, 23, 188, 70, 17, 89, 177, 13, 21, 97, 55, 54, 40, 249, 159, 9, 186, 183, 99, 119, 245, 44, 237, 84, 171, 30, 150, 148, 198, 223, 154, 166, 181, 111, 229, 93, 6, 151, 79, 80, 11, 67, 152, 173, 85, 72, 179, 48, 227, 237, 236, 3, 53, 141, 69, 81, 254, 233, 16, 44, 44, 238, 237, 119, 58, 142, 10, 8, 159, 125, 152, 153, 127, 235, 209, 204, 35, 134, 4, 57, 50, 84, 36, 66, 187, 122, 37, 140, 201, 244, 30, 48, 171, 241, 184, 119, 118, 192, 254, 180, 74, 22, 35, 118, 16, 242, 21, 51, 100, 205, 125, 171, 98, 235, 195, 187, 28, 232, 54, 115, 73, 243, 119, 69, 222, 213, 8, 62, 12, 55, 221, 110, 210, 184, 106, 58, 214, 194, 88, 20, 39, 179, 37, 84, 157, 89, 80, 150, 2, 183, 173, 22, 153, 26, 204, 183, 113, 85, 99, 200, 99, 190, 83, 229, 27, 99, 134, 54, 44, 163, 218, 61, 239, 163, 101, 131, 216, 9, 88, 188, 93, 148, 220, 104, 97, 65, 61, 212, 227, 104, 130, 151, 72, 22, 103, 158, 78, 205, 226, 11, 37, 195, 205, 255, 192, 135, 48, 97, 42, 73, 239, 93, 215, 167, 200, 38, 94, 230, 200, 139, 226, 69, 201, 26, 4, 95, 53, 72, 19, 211, 108, 150, 153, 188, 190, 80, 32, 188, 34, 122, 180, 88, 152, 136, 35, 12, 203, 159, 41, 182, 194, 31, 73, 29, 94, 91, 139, 237, 194, 45, 48, 80, 166, 243, 173, 102, 35, 216, 37, 33, 113, 66, 235, 186, 151, 71, 246, 33, 179, 164, 120, 253, 249, 186, 207, 154, 57, 6, 133, 246, 194, 129, 88, 196, 59, 109, 190, 242, 221, 36, 100, 168, 110, 252, 144, 71, 172, 37, 97, 224, 237, 216, 241, 91, 136, 111, 98, 69, 130, 190, 183, 110, 10, 10, 65, 175, 146, 134, 57, 162, 154, 110, 200, 43, 141, 41, 149, 152, 131, 7, 191, 37, 65, 218, 134, 248, 253, 144, 212, 3, 1, 96, 35, 109, 208, 40, 104, 198, 0, 108, 45, 38, 76, 220, 113, 60, 225, 190, 64, 101, 89, 238, 109, 182, 62, 184, 224, 54, 33, 163, 161, 160, 46, 172, 25, 0, 83, 0, 18, 179, 193, 40, 20, 86, 253, 174, 115, 212, 212, 154, 105, 27, 68, 142, 160, 235, 136, 126, 120, 19, 153, 225, 80, 175, 14, 51, 186, 212, 101, 11, 43, 207, 189, 65, 128, 101, 101, 68, 8, 187, 224, 113, 230, 35, 216, 171, 15, 186, 141, 204, 220, 230, 153, 45, 95, 234, 160, 86, 228, 118, 156, 161, 51, 120, 231, 206, 136, 178, 29, 255, 62, 126, 33, 209, 14, 245, 69, 22, 192, 155, 194, 118, 78, 22, 3, 38, 69, 153, 88, 157, 120, 89, 16, 225, 132, 190, 75, 210, 9, 86, 209, 4, 133, 20, 145, 191, 244, 78, 102, 180, 144, 164, 152, 146, 67, 125, 216, 10, 212, 176, 182, 149, 132, 121, 14, 38, 116, 211, 141, 158, 139, 207, 114, 193, 2, 44, 128, 239, 9, 76, 157, 72, 51, 170, 37, 222, 164, 240, 205, 123, 59, 251, 12, 6, 163, 96, 180, 23, 2, 196, 57, 124, 217, 125, 171, 68, 200, 254, 255, 190, 19, 149, 192, 217, 30, 148, 233, 238, 92, 81, 210, 3, 80, 71, 211, 121, 50, 98, 203, 223, 0, 74, 157, 107, 188, 250, 237, 84, 247, 79, 196, 244, 162, 224, 138, 120, 188, 204, 116, 73, 174, 176, 154, 86, 131, 87, 58, 219, 177, 17, 253, 213, 69, 233, 252, 26, 141, 211, 59, 40, 191, 158, 173, 207, 153, 204, 63, 98, 59, 253, 227, 126, 207, 200, 4, 31, 216, 207, 116, 38, 192, 181, 195, 157, 157, 144, 81, 12, 187, 197, 115, 1, 223, 58, 47, 214, 50, 128, 163, 179, 16, 8, 220, 200, 184, 12, 70, 199, 160, 48, 136, 53, 43, 164, 47, 220, 54, 26, 240, 188, 127, 4, 23, 189, 152, 166, 104, 244, 163, 183, 246, 170, 126, 196, 49, 205, 88, 80, 22, 204, 44, 167, 34, 233, 88, 171, 62, 31, 19, 72, 67, 121, 210, 132, 24, 240, 161, 151, 182, 220, 120, 241, 125, 68, 45, 8, 133, 50, 222, 138, 99, 21, 72, 95, 99, 28, 193, 42, 12, 45, 122, 248, 143, 234, 232, 239, 139, 218, 242, 137, 126, 43, 137, 23, 159, 117, 25, 229, 15, 66, 41, 164, 182, 246, 197, 202, 46, 14, 239, 29, 110, 61, 99, 109, 62, 218, 220, 88, 83, 26, 120, 131, 216, 86, 36, 215, 165, 127, 23, 23, 244, 164, 236, 201, 39, 67, 4, 129, 192, 1, 236, 58, 103, 141, 99, 99, 59, 61, 77, 195, 176, 208, 121, 26, 19, 207, 84, 152, 147, 205, 56, 158, 207, 164, 117, 12, 251, 160, 2, 51, 24, 225, 40, 87, 214, 131, 24, 167, 124, 214, 29, 88, 135, 60, 1, 175, 234, 176, 83, 15, 153, 159, 243, 16, 216, 152, 40, 4, 120, 215, 52, 42, 152, 35, 48, 43, 153, 213, 162, 184, 116, 112, 146, 100, 64, 178, 60, 28, 225, 128, 168, 248, 236, 169, 167, 106, 212, 186, 72, 249, 122, 68, 152, 253, 179, 23, 170, 38, 188, 71, 94, 198, 10, 81, 245, 228, 128, 155, 165, 27, 139, 98, 47, 199, 188, 156, 2, 204, 189, 63, 219, 127, 160, 223, 47, 18, 6, 173, 21, 29, 236, 189, 135, 99, 131, 213, 221, 39, 155, 85, 142, 17, 254, 217, 110, 46, 24, 148, 245, 149, 17, 29, 122, 193, 206, 188, 196, 32, 39, 228, 102, 48, 253, 42, 137, 94, 25, 245, 85, 243, 45, 237, 172, 30, 2, 86, 80, 156, 26, 128, 218, 238, 217, 48, 224, 41, 254, 216, 175, 67, 232, 118, 44, 90, 105, 196, 64, 3, 4, 217, 186, 207, 68, 78, 229, 22, 5, 115, 204, 240, 208, 183, 75, 51, 71, 248, 151, 118, 47, 39, 181, 212, 81, 189, 141, 55, 168, 110, 153, 115, 40, 73, 99, 74, 48, 116, 203, 100, 2, 69, 193, 97, 153, 164, 229, 239, 36, 211, 240, 114, 97, 178, 74, 74, 124, 96, 83, 208, 29, 200, 242, 244, 23, 196, 139, 253, 109, 193, 55, 83, 21, 184, 157, 240, 125, 138, 110, 245, 25, 88, 127, 88, 43, 186, 203, 84, 169, 39, 43, 119, 42, 209, 227, 24, 50, 250, 249, 188, 13, 11, 186, 241, 75, 178, 122, 134, 68, 223, 136, 147, 229, 49, 182, 189, 36, 227, 38, 141, 104, 75, 145, 219, 209, 14, 50, 76, 157, 13, 255, 148, 85, 20, 249, 54, 150, 215, 156, 147, 45, 123, 114, 43, 44, 26, 75, 163, 4, 171, 150, 109, 144, 79, 217, 208, 23, 178, 171, 35, 19, 249, 188, 231, 134, 69, 43, 231, 252, 127, 63, 168, 211, 50, 179, 33, 78, 59, 10, 97, 25, 78, 138, 43, 235, 229, 230, 243, 209, 183, 216, 153, 71, 254, 39, 172, 178, 203, 26, 86, 9, 1, 51, 74, 169, 181, 61, 44, 101, 14, 115, 167, 127, 252, 54, 83, 229, 96, 143, 189, 32, 149, 75, 6, 15, 190, 26, 139, 82, 133, 37, 186, 129, 36, 12, 134, 57, 81, 33, 33, 30, 243, 118, 15, 136, 45, 232, 162, 63, 38, 176, 241, 200, 158, 67, 101, 202, 177, 179, 252, 40, 168, 19, 55, 131, 44, 105, 218, 3, 247, 122, 76, 58, 200, 138, 87, 87, 74, 11, 25, 85, 47, 95, 42, 221, 42, 1, 241, 68, 149, 252, 108, 200, 211, 124, 48, 53, 4, 227, 185, 186, 191, 145, 6, 215, 155, 169, 179, 24, 147, 87, 172, 188, 65, 150, 153, 132, 81, 47, 139, 124, 195, 64, 24, 29, 155, 142, 82, 146, 3, 54, 112, 68, 235, 237, 171, 231, 125, 77, 67, 105, 218, 129, 178, 115, 183, 240, 53, 193, 78, 19, 241, 99, 90, 89, 66, 184, 66, 115, 145, 49, 128, 16, 166, 239, 209, 133, 31, 126, 154, 124, 178, 80, 251, 90, 135, 36, 178, 240, 49, 14, 115, 107, 87, 12, 229, 148, 137, 201, 132, 209, 202, 200, 231, 0, 139, 47, 234, 14, 147, 53, 251, 183, 222, 152, 145, 115, 221, 205, 222, 26, 140, 185, 109, 92, 46, 211, 83, 181, 211, 112, 94, 243, 85, 25, 22, 34, 52, 81, 101, 245, 250, 72, 52, 111, 29, 239, 167, 137, 241, 200, 191, 82, 244, 206, 73, 30, 140, 165, 4, 149, 154, 79, 94, 109, 122, 210, 242, 117, 93, 158, 172, 123, 236, 104, 111, 248, 219, 73, 230, 89, 162, 207, 0, 122, 188, 192, 104, 101, 74, 174, 26, 18, 127, 255, 253, 31, 10, 209, 65, 160, 223, 81, 162, 132, 4, 163, 168, 69, 74, 174, 23, 71, 173, 130, 195, 175, 204, 218, 253, 133, 212, 60, 246, 98, 229, 105, 1, 179, 236, 178, 127, 52, 145, 218, 90, 141, 95, 87, 206, 228, 58, 121, 118, 62, 217, 123, 187, 243, 1, 209, 26, 6, 160, 60, 31, 18, 249, 32, 94, 56, 148, 203, 200, 222, 180, 24, 36, 10, 141, 23, 36, 106, 103, 2, 123, 94, 101, 152, 10, 215, 187, 250, 204, 21, 240, 117, 7, 225, 187, 171, 228, 250, 142, 94, 7, 149, 138, 127, 174, 29, 174, 63, 111, 103, 172, 24, 186, 82, 169, 32, 233, 241, 238, 213, 251, 184, 254, 232, 79, 158, 171, 221, 254, 209, 7, 38, 150, 125, 57, 124, 157, 47, 104, 245, 22, 201, 15, 20, 69, 183, 73, 112, 161, 4, 169, 241, 188, 238, 213, 177, 83, 143, 38, 139, 52, 113, 194, 28, 61, 77, 219, 119, 219, 78, 112, 59, 21, 161, 173, 252, 147, 59, 156, 232, 175, 47, 56, 79, 208, 247, 9, 238, 216, 150, 9, 6, 168, 232, 187, 213, 237, 17, 56, 28, 224, 74, 73, 219, 168, 101, 87, 202, 37, 80, 105, 238, 35, 78, 101, 115, 67, 98, 139, 137, 141, 247, 81, 131, 158, 14, 41, 219, 32, 177, 253, 51, 18, 142, 65, 7, 244, 146, 2, 109, 224, 3, 212, 231, 154, 236, 203, 218, 230, 71, 188, 51, 212, 136, 6, 193, 36, 250, 234, 207, 224, 84, 146, 239, 253, 114, 241, 253, 241, 62, 67, 223, 125, 137, 2, 171, 75, 91, 223, 198, 32, 133, 92, 125, 210, 151, 151, 208, 125, 250, 71, 226, 161, 0, 76, 126, 19, 170, 82, 99, 162, 65, 36, 149, 94, 9, 56, 67, 94, 179, 22, 180, 111, 37, 238, 232, 150, 244, 89, 210, 172, 74, 179, 43, 5, 43, 55, 41, 95, 72, 156, 34, 88, 192, 34, 66, 80, 55, 169, 158, 189, 91, 179, 165, 162, 61, 24, 155, 134, 172, 62, 191, 118, 34, 88, 178, 44, 223, 29, 227, 232, 252, 195, 182, 89, 59, 178, 98, 117, 88, 124, 100, 22, 156, 120, 15, 14, 10, 249, 186, 97, 171, 61, 59, 1, 28, 158, 233, 34, 23, 17, 41, 145, 214, 68, 220, 4, 207, 240, 126, 245, 63, 121, 155, 103, 237, 76, 118, 142, 59, 7, 196, 250, 217, 204, 103, 227, 199, 40, 218, 241, 224, 118, 54, 238, 200, 69, 115, 59, 77, 241, 146, 13, 28, 123, 89, 84, 89, 95, 41, 213, 150, 191, 176, 33, 136, 43, 224, 145, 210, 2, 226, 142, 180, 34, 63, 7, 80, 128, 28, 45, 37, 59, 46, 224, 60, 59, 128, 40, 149, 128, 209, 88, 103, 98, 120, 115, 42, 31, 42, 30, 96, 179, 211, 58, 15, 64, 160, 228, 115, 137, 8, 238, 42, 83, 195, 102, 84, 19, 14, 11, 104, 177, 8, 179, 94, 244, 23, 203, 44, 75, 91, 73, 128, 86, 32, 150, 150, 122, 21, 34, 195, 44, 213, 70, 82, 168, 48, 131, 96, 51, 73, 68, 99, 186, 152, 209, 54, 160, 82, 143, 24, 143, 112, 161, 137, 2, 126, 238, 241, 19, 27, 29, 92, 245, 13, 153, 171, 94, 62, 176, 216, 57, 69, 23, 121, 104, 161, 150, 68, 95, 122, 30, 11, 110, 147, 230, 19, 136, 220, 234, 164, 146, 189, 3, 142, 115, 136, 248, 20, 233, 235, 184, 236, 42, 21, 108, 199, 140, 250, 120, 9, 162, 110, 182, 102, 246, 203, 28, 112, 196, 253, 202, 51, 190, 191, 77, 138, 145, 247, 233, 47, 0, 207, 37, 156, 235, 66, 110, 254, 43, 154, 229, 205, 61, 179, 33, 219, 223, 211, 186, 1, 56, 225, 97, 201, 181, 169, 137, 226, 241, 99, 224, 123, 242, 48, 173, 169, 233, 198, 1, 233, 227, 46, 40, 184, 42, 196, 137, 159, 67, 90, 245, 48, 88, 240, 206, 180, 7, 177, 76, 62, 3, 146, 73, 67, 37, 114, 59, 166, 120, 217, 76, 209, 68, 12, 141, 204, 97, 131, 95, 179, 150, 39, 223, 214, 26, 219, 19, 82, 168, 51, 88, 75, 227, 29, 120, 18, 47, 178, 91, 20, 177, 163, 111, 192, 72, 75, 34, 28, 227, 145, 143, 74, 95, 117, 199, 246, 0, 140, 178, 236, 0, 7, 95, 110, 207, 132, 255, 29, 171, 86, 120, 14, 49, 169, 249, 21, 47, 54, 51, 139, 30, 54, 65, 105, 182, 39, 23, 176, 161, 177, 221, 139, 220, 217, 247, 189, 12, 184, 9, 220, 197, 41, 181, 98, 22, 175, 150, 210, 66, 245, 34, 2, 28, 20, 28, 153, 151, 119, 95, 195, 148, 27, 163, 71, 123, 231, 56, 245, 208, 85, 79, 79, 147, 87, 247, 182, 237, 156, 249, 129, 73, 147, 69, 229, 60, 125, 29, 90, 99, 95, 145, 146, 204, 96, 211, 201, 110, 188, 124, 229, 234, 216, 24, 208, 226, 53, 182, 7, 70, 201, 43, 168, 74, 190, 163, 65, 19, 224, 37, 46, 105, 114, 71, 92, 84, 187, 201, 121, 91, 146, 110, 202, 64, 5, 198, 251, 156, 55, 245, 106, 21, 54, 5, 128, 70, 94, 226, 68, 2, 41, 64, 19, 99, 151, 114, 34, 185, 132, 111, 87, 41, 244, 102, 235, 77, 251, 29, 30, 214, 41, 116, 245, 61, 185, 234, 190, 53, 92, 165, 14, 33, 127, 209, 26, 150, 226, 157, 19, 157, 83, 164, 189, 209, 160, 247, 111, 145, 85, 25, 109, 247, 160, 148, 193, 54, 245, 36, 246, 70, 0, 32, 20, 205, 108, 1, 47, 150, 32, 193, 26, 210, 88, 141, 98, 208, 194, 40, 20, 154, 122, 216, 121, 13, 144, 103, 11, 253, 151, 236, 16, 91, 78, 216, 34, 0, 29, 153, 26, 51, 245, 148, 172, 196, 129, 15, 172, 19, 119, 253, 112, 36, 112, 253, 142, 10, 111, 143, 94, 89, 82, 115, 117, 109, 2, 178, 18, 64, 3, 173, 215, 230, 78, 96, 76, 63, 192, 23, 154, 246, 146, 145, 32, 73, 83, 226, 117, 222, 179, 232, 178, 109, 34, 75, 75, 29, 234, 37, 133, 253, 232, 173, 155, 171, 250, 200, 31, 183, 230, 76, 95, 18, 55, 151, 62, 50, 47, 51, 152, 219, 154, 32, 97, 37, 68, 66, 198, 123, 105, 238, 108, 138, 190, 161, 166, 240, 57, 163, 201, 164, 160, 87, 50, 53, 16, 111, 184, 120, 134, 246, 164, 231, 37, 148, 129, 163, 222, 43, 136, 94, 125, 146, 156, 129, 240, 136, 159, 27, 220, 149, 227, 78, 179, 77, 104, 111, 190, 197, 31, 62, 238, 59, 237, 46, 134, 29, 211, 57, 207, 191, 38, 18, 213, 73, 138, 50, 34, 141, 105, 113, 172, 144, 122, 186, 52, 94, 0, 42, 233, 114, 141, 209, 147, 161, 7, 163, 183, 51, 47, 146, 39, 153, 215, 112, 208, 147, 25, 106, 250, 177, 80, 219, 197, 188, 170, 186, 168, 139, 130, 62, 225, 50, 197, 119, 164, 109, 51, 23, 4, 25, 123, 137, 211, 254, 200, 220, 151, 201, 132, 132, 244, 177, 100, 173, 98, 126, 245, 159, 226, 138, 31, 173, 91, 213, 203, 55, 201, 215, 59, 160, 28, 131, 1, 254, 148, 90, 44, 27, 134, 73, 101, 41, 73, 192, 211, 238, 220, 215, 27, 133, 64, 204, 81, 25, 141, 42, 114, 235, 57, 72, 217, 126, 253, 133, 128, 93, 116, 162, 216, 31, 10, 131, 67, 143, 108, 125, 205, 245, 15, 106, 58, 172, 144, 109, 51, 39, 246, 190, 191, 198, 57, 215, 85, 112, 229, 232, 185, 58, 54, 77, 31, 35, 22, 100, 27, 204, 214, 163, 151, 63, 164, 81, 228, 153, 37, 67, 73, 13, 123, 185, 140, 254, 20, 224, 133, 184, 71, 236, 227, 30, 103, 72, 232, 86, 9, 121, 197, 20, 81, 13, 183, 229, 176, 165, 185, 205, 78, 21, 114, 28, 241, 231, 220, 226, 201, 235, 132, 175, 221, 160, 245, 67, 96, 210, 176, 44, 126, 206, 235, 32, 24, 248, 142, 138, 149, 238, 15, 160, 35, 108, 242, 210, 143, 120, 184, 221, 239, 116, 82, 40, 201, 146, 90, 220, 110, 14, 17, 0, 238, 255, 101, 17, 35, 219, 40, 246, 118, 16, 222, 2, 212, 124, 24, 101, 62, 169, 50, 55, 129, 59, 139, 200, 177, 37, 175, 204, 228, 9, 29, 13, 193, 1, 72, 187, 125, 254, 202, 120, 48, 78, 41, 68, 55, 196, 150, 125, 13, 140, 84, 146, 181, 113, 235, 1, 190, 116, 45, 191, 149, 93, 211, 235, 61, 92, 26, 103, 27, 57, 60, 38, 37, 69, 116, 154, 212, 39, 237, 184, 208, 54, 206, 217, 31, 170, 200, 212, 15, 121, 139, 235, 174, 46, 142, 186, 120, 214, 184, 148, 103, 55, 154, 165, 144, 74, 56, 216, 201, 127, 181, 114, 242, 185, 184, 199, 231, 201, 124, 169, 154, 208, 55, 160, 255, 137, 136, 49, 13, 223, 87, 111, 63, 26, 84, 71, 84, 7, 244, 213, 179, 228, 160, 82, 158, 129, 102, 16, 159, 220, 140, 231, 123, 188, 54, 8, 61, 163, 62, 156, 49, 5, 63, 181, 101, 22, 32, 197, 189, 247, 78, 66, 248, 51, 38, 47, 195, 64, 165, 19, 50, 190, 190, 83, 142, 108, 86, 131, 68, 154, 64, 7, 196, 245, 90, 162, 81, 116, 7, 43, 99, 172, 4, 246, 36, 25, 234, 6, 141, 219, 124, 32, 235, 152, 183, 132, 103, 135, 213, 243, 22, 198, 175, 137, 142, 182, 7, 175, 76, 83, 101, 186, 31, 162, 34, 101, 214, 69, 57, 130, 192, 194, 191, 219, 25, 11, 175, 217, 114, 54, 93, 84, 240, 242, 66, 21, 194, 150, 181, 22, 55, 83, 131, 230, 229, 132, 117, 48, 216, 149, 34, 52, 124, 139, 177, 240, 243, 52, 141, 148, 146, 147, 221, 220, 70, 28, 50, 220, 171, 119, 10, 20, 206, 58, 233, 209, 245, 1, 128, 30, 84, 217, 213, 173, 246, 253, 36, 72, 31, 154, 4, 56, 110, 5, 88, 81, 30, 130, 201, 6, 123, 12, 249, 36, 67, 253, 180, 63, 169, 36, 24, 177, 190, 94, 124, 74, 165, 23, 174, 24, 77, 205, 92, 119, 103, 215, 64, 115, 64, 117, 158, 127, 126, 230, 42, 167, 98, 150, 156, 12, 86, 183, 118, 122, 139, 73, 98, 55, 78, 166, 207, 99, 108, 181, 81, 161, 178, 209, 119, 68, 174, 77, 4, 220, 209, 70, 164, 90, 0, 12, 212, 208, 36, 174, 174, 216, 190, 157, 100, 200, 41, 192, 165, 179, 148, 219, 218, 253, 249, 182, 230, 242, 7, 228, 104, 50, 142, 56, 199, 128, 125, 104, 75, 21, 240, 83, 16, 113, 85, 199, 195, 210, 181, 152, 105, 245, 187, 87, 231, 120, 223, 15, 23, 45, 36, 6, 150, 211, 36, 128, 118, 20, 91, 46, 63, 100, 0, 210, 100, 218, 172, 192, 203, 107, 241, 134, 140, 82, 235, 95, 207, 151, 143, 210, 82, 68, 239, 255, 135, 135, 169, 94, 100, 25, 115, 188, 154, 13, 202, 133, 200, 117, 186, 119, 39, 136, 174, 255, 134, 237, 250, 182, 47, 177, 218, 69, 56, 55, 99, 19, 5, 94, 202, 68, 51, 223, 229, 118, 180, 210, 177, 113, 117, 110, 51, 227, 192, 74, 81, 40, 202, 219, 110, 47, 211, 73, 105, 14, 159, 146, 222, 59, 186, 146, 100, 11, 73, 227, 14, 24, 50, 136, 80, 0, 115, 55, 48, 76, 224, 230, 131, 36, 249, 51, 147, 175, 7, 239, 4, 152, 101, 241, 108, 63, 119, 190, 152, 230, 148, 197, 216, 49, 222, 30, 133, 131, 246, 57, 74, 43, 135, 115, 152, 136, 0, 38, 30, 255, 84, 139, 191, 219, 93, 59, 170, 35, 184, 70, 133, 89, 129, 117, 114, 142, 91, 31, 134, 168, 134, 95, 46, 210, 231, 248, 180, 21, 196, 179, 20, 240, 190, 99, 200, 117, 137, 189, 112, 70, 114, 43, 58, 41, 152, 58, 182, 38, 70, 240, 238, 75, 144, 214, 26, 56, 63, 37, 123, 184, 66, 35, 228, 0, 192, 101, 211, 204, 158, 9, 230, 16, 166, 79, 110, 233, 214, 103, 127, 162, 51, 148, 176, 8, 220, 252, 230, 152, 103, 46, 27, 68, 137, 17, 87, 141, 186, 11, 238, 67, 45, 188, 144, 240, 22, 111, 34, 132, 141, 242, 125, 107, 88, 175, 175, 88, 66, 113, 12, 150, 17, 229, 130, 218, 216, 199, 15, 166, 255, 104, 197, 227, 138, 197, 223, 196, 149, 49, 1, 240, 130, 57, 163, 131, 231, 172, 161, 26, 212, 138, 153, 123, 173, 0, 97, 236, 251, 136, 237, 90, 30, 28, 11, 95, 253, 23, 62, 34, 73, 172, 121, 249, 245, 176, 225, 131, 191, 9, 129, 20, 74, 109, 48, 231, 90, 234, 167, 168, 232, 253, 54, 182, 15, 188, 216, 201, 58, 44, 110, 126, 120, 118, 4, 62, 18, 254, 28, 17, 150, 139, 59, 14, 124, 225, 34, 182, 63, 54, 211, 45, 26, 183, 66, 111, 21, 195, 18, 199, 43, 45, 117, 94, 71, 104, 226, 160, 120, 74, 88, 161, 159, 0, 137, 178, 109, 128, 234, 202, 95, 86, 83, 4, 250, 97, 189, 208, 251, 28, 37, 255, 17, 179, 160, 233, 185, 200, 133, 252, 201, 205, 36, 198, 14, 207, 35, 2, 238, 183, 208, 22, 46, 108, 68, 162, 143, 159, 155, 132, 186, 229, 194, 30, 202, 38, 172, 127, 111, 117, 149, 218, 152, 223, 81, 138, 10, 223, 128, 57, 196, 13, 154, 132, 247, 33, 206, 30, 227, 220, 232, 245, 93, 185, 167, 237, 106, 135, 16, 232, 36, 206, 116, 9, 124, 79, 68, 235, 62, 180, 79, 126, 151, 70, 57, 192, 168, 132, 243, 254, 196, 141, 47, 176, 11, 68, 138, 251, 158, 134, 20, 54, 150, 240, 150, 193, 118, 177, 196, 73, 160, 82, 25, 148, 183, 244, 133, 145, 69, 89, 160, 112, 82, 47, 101, 58, 233, 45, 97, 40, 38, 127, 24, 123, 48, 177, 202, 28, 130, 237, 61, 56, 153, 113, 18, 40, 203, 123, 100, 45, 116, 132, 67, 124, 15, 194, 80, 198, 83, 170, 96, 90, 157, 111, 247, 31, 83, 193, 84, 250, 126, 138, 137, 69, 177, 14, 55, 104, 215, 143, 58, 225, 194, 189, 25, 114, 219, 210, 11, 53, 156, 124, 175, 59, 126, 228, 239, 34, 11, 65, 93, 242, 138, 252, 211, 237, 226, 72, 223, 5, 115, 158, 27, 125, 125, 167, 156, 222, 253, 168, 246, 216, 186, 121, 37, 254, 249, 9, 29, 122, 5, 114, 217, 245, 175, 183, 39, 244, 104, 55, 54, 82, 109, 71, 157, 88, 216, 168, 105, 246, 125, 117, 226, 156, 103, 37, 160, 216, 101, 30, 35, 30, 177, 36, 200, 135, 249, 123, 225, 195, 96, 44, 24, 175, 79, 203, 37, 13, 68, 190, 3, 152, 12, 206, 99, 254, 77, 136, 53, 26, 182, 233, 220, 139, 2, 77, 87, 221, 228, 232, 103, 157, 159, 50, 34, 47, 136, 109, 235, 109, 9, 114, 65, 112, 130, 33, 2, 161, 136, 237, 127, 197, 240, 51, 197, 213, 159, 199, 235, 232, 179, 246, 239, 133, 70, 158, 170, 86, 169, 56, 50, 39, 72, 153, 56, 108, 235, 160, 104, 214, 200, 204, 118, 133, 149, 86, 19, 142, 121, 130, 177, 28, 179, 236, 245, 52, 5, 194, 120, 247, 63, 123, 51, 80, 157, 197, 172, 230, 173, 39, 24, 165, 233, 44, 157, 82, 131, 242, 232, 212, 93, 143, 61, 181, 179, 128, 125, 252, 248, 234, 201, 89, 4, 94, 170, 128, 156, 151, 28, 200, 38, 90, 121, 246, 151, 201, 176, 230, 102, 179, 26, 142, 59, 107, 17, 242, 138, 110, 248, 62, 113, 2, 127, 78, 240, 189, 170, 12, 253, 90, 220, 209, 174, 246, 243, 32, 156, 111, 253, 212, 91, 245, 239, 69, 84, 150, 177, 149, 81, 5, 167, 194, 242, 219, 117, 20, 7, 57, 170, 206, 92, 60, 119, 120, 240, 240, 90, 239, 155, 189, 66, 83, 232, 52, 203, 26, 79, 206, 193, 182, 197, 11, 26, 168, 175, 39, 76, 76, 191, 226, 115, 244, 63, 15, 143, 176, 25, 96, 203, 196, 252, 83, 81, 251, 235, 144, 74, 67, 213, 52, 177, 44, 76, 185, 163, 254, 52, 129, 54, 64, 83, 245, 76, 163, 129, 126, 204, 141, 21, 71, 72, 241, 152, 217, 72, 176, 163, 21, 104, 254, 130, 140, 99, 21, 6, 142, 97, 64, 201, 56, 210, 46, 176, 112, 133, 119, 232, 209, 131, 78, 129, 197, 35, 113, 242, 0, 65, 228, 105, 241, 255, 66, 152, 11, 79, 81, 176, 185, 45, 121, 192, 182, 54, 229, 1, 63, 224, 221, 186, 116, 131, 253, 23, 193, 109, 238, 79, 128, 164, 151, 86, 55, 85, 85, 58, 218, 143, 82, 123, 9, 172, 211, 151, 165, 220, 19, 215, 174, 219, 232, 246, 54, 150, 75, 27, 140, 198, 22, 93, 141, 145, 170, 31, 34, 16, 7, 181, 100, 68, 74, 123, 216, 235, 160, 124, 126, 232, 169, 99, 70, 135, 185, 249, 193, 79, 187, 180, 219, 55, 13, 142, 120, 1, 164, 169, 104, 248, 249, 49, 41, 80, 192, 19, 46, 164, 195, 133, 177, 189, 253, 130, 124, 47, 232, 155, 100, 107, 47, 246, 82, 87, 178, 107, 179, 34, 244, 18, 168, 83, 195, 79, 44, 44, 121, 22, 98, 38, 29, 102, 51, 29, 163, 12, 121, 13, 217, 110, 247, 128, 133, 215, 77, 31, 226, 178, 55, 17, 194, 221, 15, 63, 6, 147, 67, 162, 127, 164, 11, 12, 150, 154, 11, 228, 23, 108, 184, 145, 115, 183, 34, 136, 88, 34, 66, 140, 247, 189, 246, 120, 208, 15, 71, 247, 157, 138, 153, 197, 160, 183, 91, 11, 242, 230, 248, 145, 63, 207, 112, 81, 22, 143, 12, 190, 77, 120, 18, 216, 47, 25, 3, 80, 84, 85, 158, 230, 38, 164, 6, 174, 67, 194, 62, 67, 121, 154, 100, 193, 108, 167, 113, 114, 184, 125, 204, 31, 139, 44, 23, 87, 194, 12, 26, 251, 85, 223, 191, 170, 16, 218, 47, 34, 242, 129, 129, 118, 253, 16, 215, 26, 22, 78, 17, 21, 174, 238, 90, 66, 74, 113, 126, 234, 224, 76, 248, 136, 17, 220, 207, 3, 185, 7, 165, 203, 181, 79, 66, 180, 77, 72, 48, 225, 30, 141, 210, 240, 133, 184, 185, 120, 212, 63, 222, 29, 220, 245, 186, 67, 84, 179, 73, 205, 210, 224, 84, 65, 73, 207, 215, 111, 70, 181, 209, 254, 138, 11, 134, 216, 235, 91, 171, 107, 53, 78, 129, 18, 37, 82, 102, 64, 96, 110, 12, 26, 189, 205, 94, 194, 131, 52, 203, 58, 119, 129, 65, 145, 74, 224, 233, 63, 214, 48, 3, 131, 185, 71, 22, 117, 252, 153, 2, 211, 191, 105, 105, 177, 104, 49, 119, 28, 235, 216, 71, 41, 172, 11, 102, 220, 204, 25, 205, 157, 215, 210, 154, 148, 116, 160, 24, 61, 96, 95, 221, 219, 15, 55, 29, 178, 85, 135, 203, 148, 208, 77, 18, 125, 232, 244, 156, 143, 149, 35, 243, 180, 9, 107, 174, 145, 7, 187, 8, 157, 44, 163, 112, 70, 212, 237, 47, 89, 109, 127, 155, 113, 146, 204, 116, 208, 47, 179, 96, 141, 231, 45, 173, 96, 170, 54, 14, 109, 68, 113, 246, 33, 143, 137, 157, 240, 29, 221, 129, 203, 10, 14, 253, 248, 102, 114, 206, 237, 51, 219, 87, 181, 178, 142, 76, 79, 179, 209, 53, 103, 101, 63, 235, 47, 248, 203, 52, 167, 216, 22, 231, 241, 99, 2, 58, 150, 253, 184, 82, 193, 77, 152, 85, 66, 63, 155, 202, 83, 99, 21, 183, 154, 12, 218, 127, 223, 216, 5, 242, 32, 108, 203, 142, 80, 9, 128, 4, 155, 4, 178, 92, 3, 117, 121, 236, 148, 106, 66, 235, 182, 13, 171, 220, 156, 191, 171, 30, 179, 144, 5, 78, 252, 174, 109, 58, 23, 94, 145, 80, 27, 236, 51, 199, 54, 174, 188, 15, 236, 111, 107, 159, 190, 138, 18, 241, 82, 221, 21, 91, 166, 153, 39, 68, 76, 20, 169, 58, 74, 88, 39, 146, 153, 207, 108, 16, 99, 33, 175, 227, 246, 54, 38, 68, 70, 193, 59, 84, 41, 36, 44, 93, 18, 22, 59, 47, 247, 111, 84, 91, 10, 74, 146, 170, 189, 250, 175, 38, 254, 105, 111, 71, 155, 37, 245, 145, 208, 136, 245, 182, 255, 17, 14, 92, 40, 203, 232, 18, 31, 10, 250, 247, 87, 126, 201, 35, 69, 173, 59, 12, 239, 38, 30, 184, 29, 185, 147, 16, 209, 193, 47, 199, 115, 154, 65, 217, 53, 203, 93, 117, 70, 21, 109, 0, 87, 50, 170, 78, 185, 23, 141, 5, 229, 168, 194, 238, 99, 124, 187, 73, 85, 233, 73, 123, 119, 34, 161, 70, 171, 109, 134, 174, 111, 50, 195, 239, 101, 62, 250, 193, 137, 198, 146, 131, 60, 107, 10, 191, 240, 34, 141, 180, 228, 227, 241, 152, 200, 103, 182, 52, 32, 49, 41, 226, 42, 206, 118, 201, 70, 106, 16, 142, 79, 131, 35, 206, 219, 13, 100, 23, 43, 215, 20, 222, 251, 164, 125, 77, 71, 42, 93, 51, 110, 48, 57, 104, 44, 118, 41, 48, 148, 63, 237, 146, 117, 222, 96, 245, 34, 102, 226, 96, 94, 192, 117, 10, 81, 72, 156, 104, 255, 8, 67, 248, 47, 145, 115, 123, 62, 255, 160, 166, 168, 17, 174, 250, 72, 79, 252, 254, 73, 87, 157, 120, 7, 122, 124, 116, 136, 94, 7, 203, 204, 128, 70, 159, 155, 142, 59, 66, 3, 28, 148, 172, 254, 247, 36, 133, 131, 150, 110, 238, 145, 47, 71, 140, 24, 55, 30, 92, 165, 159, 150, 3, 164, 22, 238, 91, 70, 132, 70, 174, 160, 216, 45, 169, 72, 71, 184, 62, 9, 25, 134, 9, 194, 101, 181, 52, 60, 191, 165, 123, 199, 174, 2, 182, 51, 177, 72, 136, 235, 4, 102, 22, 78, 197, 35, 11, 9, 186, 45, 61, 163, 19, 107, 188, 150, 79, 231, 17, 43, 140, 72, 188, 84, 237, 116, 101, 149, 148, 7, 40, 143, 231, 66, 65, 28, 33, 166, 7, 36, 35, 127, 33, 82, 238, 215, 146, 246, 35, 72, 199, 250, 215, 79, 162, 222, 167, 36, 142, 232, 221, 134, 254, 176, 23, 250, 117, 207, 87, 158, 48, 19, 127, 44, 183, 8, 12, 147, 29, 18, 241, 83, 175, 52, 14, 250, 191, 28, 183, 120, 177, 112, 127, 14, 2, 156, 215, 60, 130, 11, 244, 90, 209, 9, 164, 196, 187, 16, 7, 135, 56, 31, 93, 119, 16, 103, 132, 172, 54, 129, 110, 183, 72, 118, 234, 44, 246, 103, 58, 248, 107, 114, 245, 124, 193, 120, 30, 73, 57, 231, 178, 173, 157, 199, 161, 155, 221, 133, 106, 8, 233, 79, 186, 113, 209, 111, 224, 150, 1, 169, 102, 97, 54, 192, 194, 195, 62, 113, 213, 168, 126, 188, 119, 239, 143, 115, 35, 93, 83, 204, 17, 94, 177, 66, 214, 106, 131, 180, 29, 160, 147, 156, 11, 241, 7, 17, 73, 187, 171, 19, 88, 108, 221, 109, 170, 199, 213, 254, 112, 66, 185, 182, 223, 39, 122, 50, 41, 61, 234, 92, 74, 14, 138, 126, 104, 104, 233, 101, 202, 220, 118, 113, 98, 21, 187, 112, 130, 3, 165, 200, 128, 206, 243, 149, 234, 228, 127, 209, 222, 251, 131, 130, 192, 62, 39, 193, 152, 138, 19, 62, 121, 36, 171, 13, 114, 106, 55, 215, 176, 151, 156, 78, 61, 48, 182, 34, 76, 3, 252, 126, 81, 181, 162, 68, 254, 162, 152, 7, 133, 177, 141, 50, 210, 166, 91, 248, 194, 243, 188, 206, 58, 211, 11, 138, 136, 112, 251, 201, 169, 66, 124, 176, 165, 193, 6, 150, 247, 29, 151, 242, 174, 13, 148, 121, 145, 100, 114, 226, 35, 145, 201, 26, 66, 15, 192, 63, 7, 244, 162, 122, 244, 194, 112, 121, 43, 192, 111, 245, 54, 245, 14, 165, 146, 160, 216, 36, 235, 185, 192, 141, 43, 7, 133, 225, 140, 206, 52, 50, 114, 250, 82, 115, 46, 137, 136, 213, 31, 157, 14, 246, 50, 164, 205, 102, 175, 180, 61, 143, 106, 247, 81, 232, 100, 77, 172, 25, 68, 196, 122, 156, 124, 135, 32, 57, 23, 177, 66, 254, 253, 73, 110, 160, 217, 209, 192, 212, 253, 69, 33, 86, 114, 22, 174, 114, 53, 106, 183, 71, 146, 182, 22, 15, 50, 54, 180, 121, 168, 37, 20, 245, 0, 219, 168, 99, 232, 138, 205, 182, 161, 118, 16, 207, 243, 96, 231, 208, 136, 206, 207, 158, 241, 143, 202, 156, 216, 245, 242, 203, 56, 213, 130, 102, 207, 68, 82, 50, 130, 237, 153, 207, 185, 57, 30, 241, 127, 106, 170, 239, 157, 224, 69, 131, 24, 113, 149, 71, 1, 251, 32, 81, 36, 144, 84, 166, 69, 42, 121, 219, 204, 59, 137, 36, 90, 74, 248, 133, 138, 86, 211, 188, 233, 87, 242, 246, 110, 17, 107, 128, 103, 71, 63, 158, 229, 55, 129, 25, 88, 81, 114, 245, 232, 51, 158, 115, 117, 167, 103, 144, 245, 123, 104, 88, 56, 234, 94, 65, 34, 91, 17, 217, 101, 155, 111, 246, 46, 6, 107, 217, 15, 194, 6, 47, 207, 226, 174, 123, 19, 7, 202, 131, 187, 22, 3, 188, 200, 100, 85, 138, 106, 16, 208, 177, 102, 90, 175, 6, 165, 232, 66, 14, 105, 46, 176, 46, 85, 61, 245, 220, 49, 144, 219, 35, 80, 80, 51, 202, 163, 25, 77, 253, 1, 86, 140, 38, 166, 144, 1, 0, 0, 20, 39, 5, 34, 76, 218, 228, 32, 234, 127, 64, 252, 197, 50, 16, 200, 49, 47, 190, 113, 21, 80, 108, 60, 249, 144, 139, 72, 169, 115, 41, 200, 173, 73, 22, 141, 43, 125, 186, 192, 44, 136, 23, 91, 106, 56, 97, 142, 110, 186, 35, 173, 225, 230, 175, 133, 119, 143, 51, 92, 53, 177, 56, 225, 20, 193, 50, 57, 19, 249, 122, 127, 9, 52, 75, 69, 131, 44, 170, 8, 78, 47, 111, 142, 100, 134, 25, 200, 42, 233, 125, 26, 24, 126, 48, 49, 140, 70, 116, 136, 83, 136, 245, 118, 50, 213, 198, 43, 62, 41, 218, 17, 205, 110, 53, 87, 9, 228, 32, 221, 94, 217, 170, 148, 179, 252, 183, 90, 143, 134, 83, 3, 188, 154, 125, 20, 157, 53, 67, 71, 110, 39, 104, 83, 162, 162, 125, 203, 113, 89, 4, 126, 48, 59, 222, 33, 120, 43, 203, 38, 110, 113, 103, 36, 147, 33, 146, 243, 76, 51, 29, 164, 170, 228, 112, 27, 167, 115, 38, 164, 118, 103, 203, 2, 22, 88, 210, 208, 115, 238, 183, 22, 215, 226, 187, 10, 23, 231, 107, 241, 121, 81, 44, 254, 64, 239, 74, 33, 184, 224, 16, 189, 201, 157, 166, 48, 162, 52, 249, 69, 134, 213, 172, 187, 186, 15, 218, 207, 220, 181, 228, 189, 195, 184, 41, 239, 8, 58, 78, 140, 142, 33, 230, 76, 145, 116, 153, 84, 12, 176, 71, 219, 136, 198, 148, 12, 155, 189, 87, 95, 153, 251, 0, 252, 152, 233, 168, 117, 91, 7, 20, 250, 97, 184, 35, 131, 136, 157, 203, 48, 178, 123, 223, 170, 156, 243, 53, 147, 29, 121, 148, 8, 133, 251, 2, 131, 178, 224, 17, 86, 197, 16, 123, 223, 88, 40, 26, 93, 243, 91, 141, 34, 26, 181, 55, 202, 163, 18, 212, 6, 227, 235, 243, 64, 60, 63, 195, 255, 211, 85, 223, 151, 175, 62, 160, 49, 188, 73, 210, 253, 239, 179, 99, 106, 75, 248, 137, 229, 96, 160, 163, 80, 43, 151, 194, 141, 138, 149, 225, 42, 244, 216, 212, 89, 22, 67, 93, 99, 149, 250, 76, 148, 33, 182, 135, 248, 12, 78, 25, 27, 247, 160, 108, 100, 201, 167, 156, 3, 219, 90, 78, 72, 99, 219, 205, 165, 142, 187, 72, 69, 160, 0, 0, 0, 7, 116, 117, 69, 230, 205, 208, 207, 52, 104, 17, 178, 95, 235, 75, 210, 188, 251, 223, 215, 232, 63, 221, 194, 196, 83, 220, 103, 17, 49, 124, 235, 125, 117, 21, 172, 159, 155, 193, 238, 132, 213, 159, 85, 123, 32, 126, 250, 106, 46, 31, 44, 17, 74, 211, 135, 100, 80, 144, 18, 80, 195, 45, 218, 233, 245, 167, 146, 164, 128, 131, 225, 63, 128, 158, 37, 215, 218, 220, 33, 180, 5, 179, 130, 11, 94, 34, 215, 236, 58, 139, 109, 212, 131, 103, 113, 61, 72, 86, 52, 140, 204, 47, 227, 119, 104, 14, 159, 81, 99, 55, 91, 38, 6, 8, 174, 48, 209, 98, 157, 238, 73, 12, 31, 154, 16, 192, 84, 81, 145, 8, 183, 155, 78, 19, 30, 158, 123, 90, 143, 233, 133, 107, 213, 143, 169, 191, 237, 179, 24, 6, 190, 88, 202, 40, 73, 206, 75, 234, 118, 141, 1, 0, 0, 3, 3, 3, 1, 2, 1, 2, 3, 2, 2, 1, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 1, 0, 2, 1, 2, 1, 2, 2, 2, 2, 2, 1, 1, 2, 1, 0, 2, 0, 3, 1, 1, 2, 2, 1, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 1, 0, 1, 0, 2, 1, 2, 1, 1, 2, 1, 1, 2, 2, 2, 1, 2, 2, 1, 1, 1, 0, 2, 0, 3, 3, 1, 1, 1, 2, 2, 2, 1, 2, 1, 1, 1, 1, 2, 1, 1, 2, 1, 1, 0, 1, 0, 3, 2, 1, 1, 1, 2, 2, 2, 1, 2, 2, 2, 1, 1, 1, 1, 2, 0, 2, 0, 2, 0, 1, 1, 2, 1, 1, 2, 1, 1, 2, 2, 1, 1, 2, 1, 2, 1, 0, 2, 0, 3, 1, 1, 1, 2, 2, 3, 1, 2, 2, 1, 1, 1, 2, 1, 1, 2, 1, 0, 2, 0, 1, 1, 2, 2, 2, 1, 2, 1, 1, 2, 2, 1, 0, 3, 1, 1, 2, 2, 1, 1, 2, 2, 1, 1, 1, 1, 1, 2, 2, 1, 2, 1, 0, 2, 2, 1, 2, 1, 2, 1, 2, 2, 2, 1, 2, 2, 1, 2, 0, 1, 0, 2, 0, 3, 3, 3, 3, 1, 1, 2, 1, 1, 2, 1, 2, 1, 2, 1, 1, 2, 1, 2, 1, 0, 1, 1, 2, 2, 2, 1, 2, 2, 2, 2, 1, 1, 1, 1, 2, 2, 1, 1, 0, 1, 0, 1, 2, 2, 1, 1, 1, 1, 1, 1, 2, 1, 1, 2, 2, 2, 2, 0, 2, 2, 0, 1, 2, 2, 1, 2, 2, 1, 1, 1, 1, 2, 1, 1, 1, 1, 2, 1, 0, 1, 1, 1, 0, 3, 2, 2, 1, 2, 1, 2, 2, 2, 1, 2, 2, 2, 2, 2, 1, 1, 1, 1, 0, 1, 0, 3, 3, 2, 1, 1, 1, 1, 1, 2, 1, 2, 1, 1, 1, 1, 1, 1, 2, 0, 1, 1, 1, 1, 2, 1, 1, 2, 2, 1, 1, 2, 1, 1, 2, 2, 2, 0, 2, 1, 3, 2, 1, 1, 2, 1, 1, 2, 2, 2, 1, 1, 2, 1, 2, 1, 0, 2, 0, 1, 1, 2, 1, 2, 2, 2, 2, 2, 2, 1, 1, 2, 0, 1, 0, 147, 1, 0, 0, 138, 1, 34, 76, 218, 228, 32, 234, 127, 64, 252, 197, 50, 16, 200, 49, 47, 190, 113, 3, 4, 135, 60, 249, 144, 139, 72, 169, 115, 41, 200, 173, 73, 22, 141, 43, 125, 186, 192, 1, 0, 138, 3, 91, 106, 56, 97, 142, 110, 186, 35, 173, 225, 230, 175, 133, 119, 143, 51, 92, 1, 0, 137, 0, 225, 20, 193, 50, 57, 19, 249, 122, 127, 9, 52, 75, 69, 131, 44, 170, 8, 2, 3, 135, 14, 100, 134, 25, 200, 42, 233, 125, 26, 24, 126, 48, 49, 140, 70, 116, 136, 1, 1, 1, 1, 135, 118, 50, 213, 198, 43, 62, 41, 218, 17, 205, 110, 53, 87, 9, 228, 32, 221, 2, 1, 136, 148, 179, 252, 183, 90, 143, 134, 83, 3, 188, 154, 125, 20, 157, 53, 67, 71, 3, 0, 135, 83, 162, 162, 125, 203, 113, 89, 4, 126, 48, 59, 222, 33, 120, 43, 203, 38, 138, 3, 36, 147, 33, 146, 243, 76, 51, 29, 164, 170, 228, 112, 27, 167, 115, 38, 164, 137, 1, 2, 22, 88, 210, 208, 115, 238, 183, 22, 215, 226, 187, 10, 23, 231, 107, 241, 1, 1, 1, 0, 136, 254, 64, 239, 74, 33, 184, 224, 16, 189, 201, 157, 166, 48, 162, 52, 249, 69, 139, 4, 187, 186, 15, 218, 207, 220, 181, 228, 189, 195, 184, 41, 239, 8, 58, 78, 140, 6, 9, 130, 0, 145, 116, 153, 84, 12, 176, 71, 219, 136, 198, 148, 12, 155, 189, 87, 95, 1, 0, 137, 0, 252, 152, 233, 168, 117, 91, 7, 20, 250, 97, 184, 35, 131, 136, 157, 203, 48, 1, 1, 136, 170, 156, 243, 53, 147, 29, 121, 148, 8, 133, 251, 2, 131, 178, 224, 17, 86, 1, 0, 137, 1, 223, 88, 40, 26, 93, 243, 91, 141, 34, 26, 181, 55, 202, 163, 18, 212, 6, 139, 3, 64, 60, 63, 195, 255, 211, 85, 223, 151, 175, 62, 160, 49, 188, 73, 210, 253, 138, 3, 106, 75, 248, 137, 229, 96, 160, 163, 80, 43, 151, 194, 141, 138, 149, 225, 42, 2, 0, 135, 89, 22, 67, 93, 99, 149, 250, 76, 148, 33, 182, 135, 248, 12, 78, 25, 27, 1, 1, 138, 0, 100, 201, 167, 156, 3, 219, 90, 78, 72, 99, 219, 205, 165, 142, 187, 72, 69};
+#else
+uint8_t pre_state_root[] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+#endif
 
 
 void _main(void){
 
   // get calldata
+#ifdef NATIVE
+  uint8_t* calldata = _calldata; //delme
+#else
   uint32_t calldata_size = eth2_blockDataSize();
+  if (calldata_size == 0)
+    return; // error, revert
   uint8_t* calldata = (uint8_t*) malloc( calldata_size );
-  eth2_blockDataCopy( 0, calldata_size, (i32ptr*)calldata );
+  eth2_blockDataCopy( (i32ptr*)calldata, 0, calldata_size  );
+#endif
 
   // get old merkle root
+#if NATIVE
+#else
   eth2_loadPreStateRoot((uint32_t*)pre_state_root);
+#endif
 
   // parse calldata into pointers
   // proof hashes
@@ -278,11 +354,11 @@ void _main(void){
   // proof addresses
   uint32_t addresses_length = *(uint32_t*)calldata;
   addresses = calldata+4;
-  calldata += 4 + proof_hashes_length;
+  calldata += 4 + addresses_length;
   // balances
   uint32_t balances_length = *(uint32_t*)calldata;
   balances_old = calldata+4;
-  calldata += 4 + proof_hashes_length;
+  calldata += 4 + balances_length;
   // opcodes
   uint32_t opcodes_length = *(uint32_t*)calldata;
   opcodes = calldata+4;
@@ -297,22 +373,46 @@ void _main(void){
 
   // apply transactions to get final balances
   balances_new = malloc(balances_length);
+  memcpy(balances_new, balances_old, balances_length);
   // TODO
 
   // finally, merkleize prestate and poststate
-  uint8_t* hash_stack_ptr = malloc(10000); // 10,000 is bigger than needed
-  //merkleize_new_and_old_root(0, hash_stack_ptr+80, 1);
+  uint8_t* hash_stack_ptr = malloc(10000); // 10,000 bytes is bigger than needed for depth 50 tree
+  merkleize_new_and_old_root(0, hash_stack_ptr+80, 1);
+
+  // update hash, hash_stack_ptr+40 should correspond to new merkle root hash
+  for (int i=0; i<20; i++)
+    post_state_root[i] = hash_stack_ptr[40+i];
+
+#ifdef NATIVE
+  if(verbose){
+    printf("post state root:\n");
+    for (int i=0; i<20; i++)
+      printf("%i ",post_state_root[i]);
+    printf("\n");
+  }
+#endif
 
   // verify prestate against old merkle root hash
   for (int i=0; i<20; i++){
     if (hash_stack_ptr[i] != pre_state_root[i]){
-      //return; // TODO error
+    //  return; // error, revert
     }
   }
-  // update hash, hash_stack_ptr+40 should correspond to new merkle root hash
-  for (int i=0; i<20; i++)
-    post_state_root[i] = hash_stack_ptr[40+i];
+
+#ifdef NATIVE
+#else
   eth2_savePostStateRoot((uint32_t*)post_state_root);
+#endif
 }
+
+#ifdef NATIVE
+int main(int argc, char** argv){
+  
+  //printf("%d %d %d\n",num_address_bytes, num_hash_bytes, num_balance_bytes);
+  _main();
+
+}
+#endif
 
 
