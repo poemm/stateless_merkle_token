@@ -22,16 +22,21 @@
 
 /*
 
-# to compile, read top of Makefile to make sure you have dependencies, then:
+# to use, read the Makefile to update paths to dependencies, then:
 make
 
 # to test with scout:
-path/to/scout/target/release/phase2-scout test.yaml
+path/to/scout/target/debug/phase2-scout test.yaml
+~/repos/ethereum/scout_git_20190715/target/release/phase2-scout test.yaml
 
 */
 
 #include "ewasm.h"
 #include "blake2.h"
+
+
+
+int verbose = 0;
 
 
 // these consts can't just be changed, since parts of the code assume they are unchanged
@@ -95,7 +100,7 @@ void merkleize_new_and_old_root(int depth, uint8_t *hash_stack_ptr, int leftFlag
   opcodes++;
   uint8_t addy_chunk_bit_length, addy_chunk_byte_length;
   switch (opcode){
-    case 0b00:
+    case 0:
       // get address chunk
       addy_chunk_bit_length = *address_chunks;
       addy_chunk_byte_length = (addy_chunk_bit_length+7)/8;
@@ -103,7 +108,7 @@ void merkleize_new_and_old_root(int depth, uint8_t *hash_stack_ptr, int leftFlag
       // recurse with updated depth, same hash_stack_ptr and leftFlag
       merkleize_new_and_old_root(depth+addy_chunk_bit_length, hash_stack_ptr, leftFlag);
       break;
-    case 0b01:
+    case 1:
       // recurse on right
       merkleize_new_and_old_root(depth+1, hash_stack_ptr+80, 0);
       // get hash from calldata, put in in both old and new left slots
@@ -113,8 +118,8 @@ void merkleize_new_and_old_root(int depth, uint8_t *hash_stack_ptr, int leftFlag
       // finally hash old and new
       blake2b( old_hash_output_ptr, num_hash_bytes, hash_stack_ptr, num_hash_bytes*2, NULL, 0 );
       blake2b( new_hash_output_ptr, num_hash_bytes, hash_stack_ptr+40, num_hash_bytes*2, NULL, 0 );
-      break;
-    case 0b10:
+        break;
+    case 2:
       // recurse on left
       merkleize_new_and_old_root(depth+1, hash_stack_ptr+80, 1);
       // get hash from calldata, put in in both old and new right slots
@@ -125,7 +130,7 @@ void merkleize_new_and_old_root(int depth, uint8_t *hash_stack_ptr, int leftFlag
       blake2b( old_hash_output_ptr, num_hash_bytes, hash_stack_ptr, num_hash_bytes*2, NULL, 0 );
       blake2b( new_hash_output_ptr, num_hash_bytes, hash_stack_ptr+40, num_hash_bytes*2, NULL, 0 );
       break;
-    case 0b11:
+    case 3:
       // recurse both left and right
       merkleize_new_and_old_root(depth+1, hash_stack_ptr+80, 1);
       merkleize_new_and_old_root(depth+1, hash_stack_ptr+80, 0);
@@ -138,8 +143,9 @@ void merkleize_new_and_old_root(int depth, uint8_t *hash_stack_ptr, int leftFlag
 
 
 // merkle roots, 32 bytes each
-uint8_t post_state_root[] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
 uint8_t pre_state_root[] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+uint8_t post_state_root[] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+
 
 
 void _main(void){
@@ -177,12 +183,12 @@ void _main(void){
   calldata += 4 + address_chunks_length;
 
   // verify transactions
-  // TODO: verify signatures here
+  // TODO
 
-  // apply balance transfers from transactions
+  // apply transactions to get final balances
   balances_new = malloc(balances_length);
   memcpy(balances_new, balances_old, balances_length);
-  // TODO: apply balance transfers here, new balances are currently a copy of old ones
+  // TODO
 
   // finally, merkleize prestate and poststate
   uint8_t* hash_stack_ptr = malloc(10000); // 10,000 bytes is bigger than needed for depth 50 tree
@@ -199,5 +205,6 @@ void _main(void){
     }
   }
 
+  eth2_savePostStateRoot((uint32_t*)post_state_root);
 }
 
