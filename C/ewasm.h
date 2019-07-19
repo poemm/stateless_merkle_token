@@ -175,7 +175,7 @@ void* memset(void* restrict in, int c, size_t len) {
   uint8_t* in_ptr = (uint8_t*)in;
   if (len>8){
     // set in 8-byte chunks
-    uint64_t c64 = c + (c<<8) + (c<<16) + (c<<24) + (c<<32) + (c<<40) + (c<<56);
+    uint64_t c64 = c + (c<<8) + (c<<16) + (c<<24) + (((uint64_t)c)<<32) + (((uint64_t)c)<<40) + (((uint64_t)c)<<56);
     while (len > 7) {
       *(uint64_t*)in_ptr = c64;
       in_ptr+=8;
