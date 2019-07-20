@@ -2,17 +2,17 @@
 
 
 
+# import the token contract code, which has constants the hashing function
 import merkle_token
+
 
 # flip this flag if you want more printed
 verbose = 0
 
 
-
-
-######################################################
-# Off-chain tools for managing state, creating input #
-######################################################
+##############################################
+# Build Merkle Tree or Data for Merkle Proof #
+##############################################
 
 # the merkle tree is stored as a dictionary
 #   keys are address prefix which correspond to nodes
@@ -125,6 +125,11 @@ def build_merkle_proof(depth,sorted_addresses,accounts,merkle_tree,tree_encoding
     proof_hashes += reversed(proof_hashes_for_chunk)
 
 
+
+
+##########################
+# Encode/Decode Calldata #
+##########################
 
 binary_calldata_encoding_flag = 1
 
@@ -254,12 +259,14 @@ def decode_calldata(calldata):
 
 
 
-#########
-# Tests #
-#########
+##################
+# Generate Tests #
+##################
 
-def generate_scout_test_yaml(merkle_root, calldata):
-  if verbose: print(type(merkle_root),type(calldata.hex()), calldata.hex())
+def generate_scout_test_yaml(num_address_bits=160, num_accounts_total=2**16, num_accounts_in_witness=20):
+  merkle_tree, calldata = generate_random_test(num_address_bits, num_accounts_total, num_accounts_in_witness)
+  merkle_root = merkle_tree[''][0]
+  if verbose: print(calldata.hex())
   f = open('generated.yaml', 'w')
   file_text="""beacon_state:
   execution_scripts:
@@ -280,12 +287,14 @@ shard_post_state:
   f.write(file_text)
   f.close
 
-def generate_C_test():
-  [int(calldata[i:i+2],16) for i in range(0, len(calldata), 2)]
+
+# this is useful when pasting tests into C, outputs list like: [5, 240, ..., 143]
+def convert_calldata_to_list_of_uint8(calldata):
+  return [int(calldata[i:i+2],16) for i in range(0, len(calldata), 2)]
 
 
-
-def test_random(num_address_bits=160, num_accounts=2**22, num_addresses_in_witness=20):
+# This generates a random witness.
+def generate_random_test(num_address_bits=160, num_accounts_total=2**16, num_accounts_in_witness=20):
 
   # init global in contract
   merkle_token.num_address_bits = num_address_bits
@@ -293,14 +302,14 @@ def test_random(num_address_bits=160, num_accounts=2**22, num_addresses_in_witne
 
   # generate random addresses and balances
   import random
-  accounts = {bin(random.randint(0,2**merkle_token.num_address_bits-1))[2:].zfill(merkle_token.num_address_bits):random.randint(0, 2**merkle_token.num_balance_bits-1) for i in range(num_accounts)}
+  accounts = {bin(random.randint(0,2**merkle_token.num_address_bits-1))[2:].zfill(merkle_token.num_address_bits):random.randint(0, 2**merkle_token.num_balance_bits-1) for i in range(num_accounts_total)}
   if verbose: print(accounts)
 
   # transactions are empty until we prototype them
   transactions = []
 
   # get addresses appearing in transactions, but for now just choose some randomly
-  sorted_addresses = sorted(random.sample(accounts.keys(), num_addresses_in_witness))
+  sorted_addresses = sorted(random.sample(accounts.keys(), num_accounts_in_witness))
   if verbose: print(sorted_addresses)
 
   # build merkle tree
@@ -341,61 +350,20 @@ def test_random(num_address_bits=160, num_accounts=2**22, num_addresses_in_witne
   calldata = encode_calldata(transactions, balances, address_chunks,proof_hashes,tree_encoding,sorted_addresses=sorted_addresses)
   #if verbose: print("calldata has length",len(calldata),calldata.hex())
   #if verbose: print("merkle_root",merkle_tree[''][0])
-  generate_scout_test_yaml(merkle_tree[''][0], calldata)
 
-  # call the contract
+  # call the contract written in Python
   #merkle_token.main(calldata)
 
-
-def test_random_loop():
-
-  for merkle_token.num_address_bits in [10,12,14,16,18,20]:
-    # generate random addresses and balances
-    import random
-    num_accounts=2**merkle_token.num_address_bits
-    accounts = {bin(random.randint(0,2**merkle_token.num_address_bits-1))[2:].zfill(merkle_token.num_address_bits):random.randint(0, 2**merkle_token.num_balance_bits-1) for i in range(num_accounts)}
-    # iterate over number of addresses in the witness
-    for num_addresses_in_witness in [10,20,40,80,160]:
-      if verbose: print("\nnum accounts: 2^",merkle_token.num_address_bits," num addresses in merkle proof:",num_addresses_in_witness)
-
-      # transactions are empty until we prototype them
-      transactions = []
-
-      # sort addresses
-      sorted_addresses = sorted(random.sample(accounts.keys(), num_addresses_in_witness))
-
-      merkle_tree = {}
-      build_merkle_tree(0, sorted(accounts), accounts, merkle_tree)
-      merkle_token.set_state_root(merkle_tree[''][0])
-
-      tree_encoding = []
-      address_chunks = []
-      balances = []
-      proof_hashes = []
-      build_merkle_proof(0,sorted_addresses,accounts,merkle_tree,tree_encoding,address_chunks,balances,proof_hashes)
-
-      length_of_tree_encoding_bits = len(tree_encoding)*2
-      length_of_tree_encoding_bytes = (length_of_tree_encoding_bits+7)//8
-      length_of_address_chunks_bits = len(address_chunks)*8+sum(len(chunk) for chunk in address_chunks)
-      length_of_address_chunks_bytes = (length_of_address_chunks_bits + 7)//8
-      length_of_balances_bits = len(balances)*merkle_token.num_balance_bits
-      length_of_balances_bytes = (length_of_balances_bits + 7)//8
-      length_of_hashes_bits = len(proof_hashes)*merkle_token.num_hash_bits
-      length_of_hashes_bytes = (length_of_hashes_bits + 7)//8
-      if verbose: print("  sizes: tree_encoding:",length_of_tree_encoding_bytes,\
-                      "  addy chunks",length_of_address_chunks_bytes,\
-                      "  balances", length_of_balances_bytes,\
-                      "  hashes", length_of_hashes_bytes,\
-                      "  total", length_of_tree_encoding_bytes+length_of_address_chunks_bytes+length_of_balances_bytes+length_of_hashes_bytes)
-
-      # encode calldata
-      calldata = encode_calldata(transactions, balances, address_chunks,proof_hashes,tree_encoding)
-
-      # call the contract
-      merkle_token.main(calldata)
+  return merkle_tree, calldata
 
 
 
+
+#####################
+# Handwritten Tests #
+#####################
+
+# I have these test trees and witnesses drawn on paper, used for troubleshooting
 def test_handwritten(case):
 
   # choose a case below
@@ -502,12 +470,16 @@ def test_handwritten(case):
   print("calldata has length",len(calldata),calldata.hex())
   decode_calldata(calldata)
   
-  # call the contract
+  # call the contract written in python
   #merkle_token.main(calldata)
+
+
+
+
 
 
 if __name__ == "__main__":
   # uncomment one of these
-  test_random()
-  #test_random_loop()
+  #generate_random_test_naive()
+  generate_scout_test_yaml()
   #test_handwritten(7)

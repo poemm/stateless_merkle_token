@@ -2,11 +2,11 @@
 
 ## The Code
 
-`merkle_token_contract.py` is the on-chain logic, to be ported and compiled to Wasm. `merkle_token_offchain.py` is for off-chain things like generating merkle proofs, although its algorithms are naive for now. To see merkle proof sizes for various numbers of accounts in the state and various numbers of acconts in the proof, try:
+`merkle_token.py` is the on-chain contract logic, to be ported and compiled to Wasm. `merkle_token_tools.py` is for off-chain things like generating merkle proofs, although algorithms are naive for now. To generate a Scout yaml test case, including a merkle proof encoded in the way described below, try:
 
-WARNING: Won't work, go back a commit, or wait until overhaul is done.
 ```
-python3 merkle_token_offchain.py
+python3 merkle_token_tools.py
+# should output: generated.yaml
 ```
 
 ## Introduction
@@ -181,6 +181,35 @@ Optimization 2: Edge Label Sequence: 10 1
 
 **Remark.** Notice that for a fixed-depth binary tree, the path to each leaf corresponds to a unique fixed-length binary sequence. So each leaf can correspond to a token address, since an address is a fixed-length binary sequence. The balance can also be stored at the leaf, and all accounts can be represented a as such a binary tree.
 
+
+## Binary Encoding of Merkle Proof
+
+**Definition.** The *Merkle proof* ia a binary encoding as a concatenation of the following:
+
+```
+number of bytes of hashes as a 4 byte little-endian integer
+concatenation of all raw proof hashe bytes, in depth-first post-order of a traversal of the witness
+
+number of bytes for all balances as a 4 byte little-endian integer
+concatenation of leaf balances in depth-first pre-order of a traversal of the witness
+
+number of bytes for all transactions as a 4 byte little-endian integer
+concatenation of raw transaction bytes, each prefixed with a byte for the signer's index in the sorted list of addresses in this merkle proof
+
+number of bytes for the node label sequence in optimization 2 as a 4 byte little-endian integer
+the tree structure in optimization 2 (for now, it is one byte per node with least significant bits as 00, 01, 10, or 11, but later will just concatenate the bits)
+
+number of bytes for the edge label sequence from optimization 2 as a 4 byte little-endian integer
+the edge label sequence, with each value prefixed with a new byte giving its length.
+```
+
+**Remark.** This encoding has some inefficiencies. We hope to approach the theoretical optimum in size.
+
+
+## Address(es) Recovery.
+
+**Remark.** Addresses need not be provided in the binary encoding because they can be recovered from the rest of the Merkle proof.
+
 **Algorithm.** Recover addresses from a tree with Optimization 2.
 ```
 Input: Edge and Node label sequences for a tree with Optimization 2.
@@ -196,6 +225,8 @@ Otherwise:
   if 00: Recurse with next edge label appended to current_prefix.
   Remove any labels added in this function call, then return.
 ```
+
+
 
 
 ## Merkleizing
