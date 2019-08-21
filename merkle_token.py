@@ -35,6 +35,9 @@ num_balance_bytes = (num_balance_bits+7)//8
 num_address_bytes = (num_address_bits+7)//8
 num_hash_bytes = (num_hash_bits+7)//8
 
+num_transaction_bytes=105
+num_transaction_bits=num_transaction_bytes*8
+
 # some global variables
 old_state_root = ''
 transactions = []	# list of signed messages

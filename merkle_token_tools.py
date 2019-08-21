@@ -5,6 +5,9 @@
 # import the token contract code, which has constants the hashing function
 import merkle_token
 
+import math
+import random
+
 
 # flip this flag if you want more printed
 verbose = 0
@@ -153,6 +156,8 @@ def encode_calldata(transactions, balances, address_chunks, proof_hashes, tree_e
    nonlocal calldata
    calldata+=len(chunk).to_bytes(4, byteorder='little')
    calldata+=chunk
+  # encode number of bits per hash
+  calldata+=merkle_token.num_hash_bytes.to_bytes(4, byteorder='little')
   # encode hashes as concatenation
   hashes_bytes = bytearray([])
   for h in proof_hashes:
@@ -172,7 +177,12 @@ def encode_calldata(transactions, balances, address_chunks, proof_hashes, tree_e
   if verbose: print("balance_bytes",balance_bytes.hex())
   encode_chunk(balance_bytes)
   # encode transactions
-  # TODO
+  transaction_bytes = bytearray([])
+  for t in transactions:
+    transaction_bytes += t.to_bytes(merkle_token.num_transaction_bytes, byteorder='little')
+    if verbose: print("transaction:",t.to_bytes(merkle_token.num_transaction_bytes, byteorder='little').hex())
+  #if verbose: print("transaction_bytes",transaction_bytes.hex())
+  encode_chunk(transaction_bytes)
   # encode tree encoding
   tree_encoding_bytes = bytearray([])
   # NOTE this is the right way, but we don't feel like bit twiddling yet, so just give each opcode a byte
@@ -201,6 +211,10 @@ def decode_calldata(calldata):
   pass
  else:
   idx = 0
+  # decode number of bits per hash
+  merkle_token.num_hash_bits = int.from_bytes(calldata[idx:idx+4],'little')
+  idx+=4
+  merkle_token.num_hash_bytes = (merkle_token.num_hash_bits+7)//8
   # decode proof hashes
   proof_hashes = []
   proof_hashes_length=int.from_bytes(calldata[idx:idx+4],'little')
@@ -228,7 +242,14 @@ def decode_calldata(calldata):
     idx+=merkle_token.num_balance_bytes
   if verbose: print("balances",balances)
   # decode transactions
-  # TODO
+  transactions = []
+  transactions_length=int.from_bytes(calldata[idx:idx+4],'little')
+  idx+=4
+  transaction_bytes_end = idx + transactions_length
+  while idx < transaction_bytes_end:
+    transaction += [int.from_bytes(calldata[idx:idx+merkle_token.num_transaction_bytes],'little')]
+    idx+=merkle_token.num_transaction_bytes
+  if verbose: print("transactions",transactions)
   # decode tree encoding
   tree_encoding = []
   tree_encoding_length=int.from_bytes(calldata[idx:idx+4],'little')
@@ -249,7 +270,6 @@ def decode_calldata(calldata):
     addy_chunk_bytes_length = (addy_chunk_bits_length+7)//8
     address_chunks += [bin(int.from_bytes(calldata[idx:idx+addy_chunk_bytes_length],'big'))[2:].zfill(addy_chunk_bits_length)]
     idx += addy_chunk_bytes_length
-  #  idx += addy_chunk_bytes_length
   if verbose: print("address chunks: ",address_chunks)
   #if verbose: print( proof_hashes, balances, tree_encoding, address_chunks)
   return proof_hashes, balances, tree_encoding, address_chunks
@@ -263,17 +283,17 @@ def decode_calldata(calldata):
 # Generate Tests #
 ##################
 
-def generate_scout_test_yaml(num_address_bits=160, num_accounts_total=2**16, num_accounts_in_witness=20):
-  merkle_tree, calldata = generate_random_test(num_address_bits, num_accounts_total, num_accounts_in_witness)
-  merkle_root = merkle_tree[''][0]
+def generate_scout_test_yaml(num_hash_bits=160, num_address_bits=160, num_accounts_total=2**16, num_accounts_in_witness=20):
+  merkle_tree, calldata = generate_random_test(num_hash_bits, num_address_bits, num_accounts_total, num_accounts_in_witness)
+  merkle_root = merkle_tree[''][0].ljust(64,'0')
   if verbose: print(calldata.hex())
-  f = open('generated.yaml', 'w')
+  f = open("merkle_token__hash"+str(num_hash_bits)+"_addy"+str(num_address_bits)+"_treesize"+str(num_accounts_total)+"_witnesssize"+str(num_accounts_in_witness)+".yaml", 'w')
   file_text="""beacon_state:
   execution_scripts:
     - merkle_token.wasm
 shard_pre_state:
   exec_env_states:
-    - "%s000000000000000000000000"
+    - "%s"
 shard_blocks:
   - env: 0
     data: ""
@@ -281,11 +301,12 @@ shard_blocks:
     data: "%s"
 shard_post_state:
   exec_env_states:
-    - "%s000000000000000000000000"
+    - "%s"
 """%(merkle_root,calldata.hex(),merkle_root)
   if verbose: print(file_text)
   f.write(file_text)
   f.close
+  return merkle_tree, calldata
 
 
 # this is useful when pasting tests into C, outputs list like: [5, 240, ..., 143]
@@ -294,16 +315,18 @@ def convert_calldata_to_list_of_uint8(calldata):
 
 
 # This generates a random witness.
-def generate_random_test(num_address_bits=160, num_accounts_total=2**16, num_accounts_in_witness=20):
+def generate_random_test(num_hash_bits=160, num_address_bits=160, num_accounts_total=2**16, num_accounts_in_witness=20):
+  if verbose: print("generate_random_test(",num_hash_bits, num_address_bits, num_accounts_total, num_accounts_in_witness,")")
 
   # init global in contract
+  merkle_token.num_hash_bits = num_hash_bits
+  merkle_token.num_hash_bytes = (num_hash_bits+7)//8
   merkle_token.num_address_bits = num_address_bits
   merkle_token.num_address_bytes = (num_address_bits+7)//8
 
   # generate random addresses and balances
-  import random
   accounts = {bin(random.randint(0,2**merkle_token.num_address_bits-1))[2:].zfill(merkle_token.num_address_bits):random.randint(0, 2**merkle_token.num_balance_bits-1) for i in range(num_accounts_total)}
-  if verbose: print(accounts)
+  if verbose: print("accounts:",accounts)
 
   # transactions are empty until we prototype them
   transactions = []
@@ -356,6 +379,27 @@ def generate_random_test(num_address_bits=160, num_accounts_total=2**16, num_acc
 
   return merkle_tree, calldata
 
+
+
+#def generate_various_scout_tests(num_hash_bits=[160,256], num_address_bits=[160,256], num_accounts_total=[2**5], num_accounts_in_witness=[2]):
+def generate_various_scout_tests(num_hash_bits=[160,256], num_address_bits=[256], num_accounts_total=[1000, 10000, 100000, 1000000, 4000000], num_accounts_in_witness=[10,20,40,80,160]):
+  for numhashbits in num_hash_bits:
+    for numaddybits in num_address_bits:
+      for numacctstotal in num_accounts_total:
+        for numacctsinwitness in num_accounts_in_witness:
+          print("generating test for:",numhashbits,numaddybits, numacctstotal, numacctsinwitness)
+          merkle_tree, calldata = generate_scout_test_yaml(num_hash_bits=numhashbits, num_address_bits=numaddybits, num_accounts_total=numacctstotal, num_accounts_in_witness=numacctsinwitness)
+          num_hash_bytes_total = int.from_bytes(calldata[4:8],'little')
+          num_transaction_bytes_total = (numacctsinwitness//2) * merkle_token.num_transaction_bytes
+          num_account_bytes_total = merkle_token.num_address_bytes*numacctsinwitness
+          num_balance_bytes_total = merkle_token.num_balance_bytes*numacctsinwitness
+          calldata_size = len(calldata) - num_account_bytes_total + num_transaction_bytes_total
+          naive_calldata_size = merkle_token.num_hash_bytes*math.log(numacctstotal,2)*numacctsinwitness + len(calldata) - num_hash_bytes_total - num_account_bytes_total + num_transaction_bytes_total
+          print("calldata_size:", calldata_size, "naive way:", naive_calldata_size, "savings:", (naive_calldata_size-calldata_size)/naive_calldata_size)
+          print("hashes as percent of calldata", num_hash_bytes_total/calldata_size)
+          num_non_hash_acct_tx_bytes = calldata_size-num_hash_bytes_total-num_account_bytes_total-num_transaction_bytes_total-num_balance_bytes_total
+          print("tree encoding bytes: ",num_non_hash_acct_tx_bytes, "ratio",num_non_hash_acct_tx_bytes/calldata_size)
+          print("\n")
 
 
 
@@ -481,5 +525,6 @@ def test_handwritten(case):
 if __name__ == "__main__":
   # uncomment one of these
   #generate_random_test_naive()
-  generate_scout_test_yaml()
+  generate_various_scout_tests()
+  #generate_scout_test_yaml()
   #test_handwritten(7)

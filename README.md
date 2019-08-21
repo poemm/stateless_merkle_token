@@ -326,7 +326,7 @@ MAIN()
 
 **Remark.** It is expensive to verify signatures, expensive to compute merkle roots, and expensive to hash. Some possible solutions:
  - We combine verify root and update root to a single pass over the hashes.
- - We use Ed25519 signatures because they hold speed records at the 128-bit security level.
+ - We use Ed25519 signatures because they hold speed records at the 128-bit security level, and can be batch processed for a 2x speedup.
  - We propose parallelism for both merkleization and signature verification.
  - Succinct zero knowledge proofs.
 
