@@ -1,5 +1,7 @@
 # Stateless Token Contract
 
+THIS IS UNDERGOING AN OVERHAUL. LEAVING THIS REPO UP IN CASE SOMEONE WANTS TO SEE OLD VERSION.
+
 ## The Code
 
 `merkle_token.py` is the on-chain contract logic, to be ported and compiled to Wasm. `merkle_token_tools.py` is for off-chain things like generating merkle proofs, although algorithms are naive for now. To generate a Scout yaml test case, including a merkle proof encoded in the way described below, try:
