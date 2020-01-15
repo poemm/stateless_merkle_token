@@ -1,6 +1,7 @@
-# Stateless Token Contract
 
-THIS IS UNDERGOING AN OVERHAUL. LEAVING THIS REPO UP IN CASE SOMEONE WANTS TO SEE OLD VERSION.
+MOVED WORK TO https://github.com/poemm/stateless_kmm_token. THIS REPO HAS OLD INCOMPLETE VERSION.
+
+# Stateless Token Contract
 
 ## The Code
 
